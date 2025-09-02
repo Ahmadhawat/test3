@@ -1,0 +1,110 @@
+Top – hier ist ein fertiges Python-Snippet, das deine LLM (auch wenn sie card_1 nicht kennt) mit einem System-Prompt füttert und aus einer „messy“ Frage eine optimierte card_1-Hilfe-Suche macht.
+Du kannst es direkt in dein Projekt kopieren (passt zu einem OpenAI-/Ollama-kompatiblen /v1/chat/completions-Endpoint).
+
+# correct_card1_query.py
+import os
+import sys
+import json
+import requests
+
+# === Konfiguration ============================================================
+# Passe diese drei Werte an deine Umgebung an:
+API_URL   = os.environ.get("LLM_API_URL", "http://localhost:11434/v1/chat/completions")
+API_KEY   = os.environ.get("LLM_API_KEY", "YOUR_API_KEY")
+MODEL_NAME = os.environ.get("LLM_MODEL", "llama3.3:latest")  # z.B. "gpt-4o-mini", "llama3.3:latest", ...
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json",
+}
+
+# === System-Prompt: Query-Rewriter für card_1 =================================
+SYSTEM_PROMPT = """
+Du bist ein Query-Rewriter für technische Software-Hilfen.
+
+Kontext:
+- Die Software heißt „card_1“. Sie ist eine CAD-/BIM-Software für Vermessung und Infrastruktur:
+  Straßen-/Schienenplanung, Kanalplanung, DGM/Geländemodelle, Punktwolken, Querprofile, Planerstellung,
+  Datenimport/-export (IFC, LandXML, OKSTRA, ISYBAU, DWG/DXF), Visualisierung/3D, Abrechnung (REB/GAEB).
+- Ziel: unsaubere Nutzerfragen in eine präzise, suchoptimierte Abfrage für die card_1-Dokumentation umschreiben.
+
+Regeln:
+1) Kläre vage Begriffe mit card_1-typischer Terminologie (z. B. „Profile“ → „Querprofile aus Achsdaten“).
+2) Nutze Fachbegriffe aus diesen Themenfeldern, wenn passend:
+   Achse/Trasse, Gradiente, Querprofil, Stationierung, DGM/DTM, Längsprofil, Punktwolke/Laserscan,
+   Vermessung/Punkte/CSV/ASCII, Kanalplanung/Haltung/Schacht, BIM/IFC/BCF, LandXML, OKSTRA, ISYBAU,
+   DWG/DXF, GAEB/REB, Planausgabe/Planrahmen/Plot, 3D-Visualisierung/Render, Geländeaufmaß,
+   Knoten/Weiche, Breitenaufmaß, Massen/Erdbau, Export/Import, Attributierung.
+3) Ergänze sinnvolle Synonyme/Varianz (z. B. „exportieren“ | „ausgeben“, „importieren“ | „einlesen“).
+4) Entferne Füllwörter, Umgangssprache und Unschärfen. Formuliere fachlich, klar, präzise.
+5) Ausgabeformat: **GIB AUSSCHLIESSLICH die optimierte Suchanfrage als EINEN Satz** zurück – ohne Einleitung, ohne Erklärung.
+
+Beispiele:
+- Eingabe: "Wie mache ich Profile in card1?"
+  Ausgabe: "Wie erzeugt man in card_1 aus einer bestehenden Straßenachse Querprofile und gibt sie als Plan oder 3D-Ansicht aus?"
+
+- Eingabe: "Punkte laden geht nicht, was tun?"
+  Ausgabe: "Wie importiert man Vermessungspunkte (CSV/ASCII) in card_1 und weist sie einem Projekt mit korrektem Koordinatensystem zu?"
+
+- Eingabe: "IFC für BIM exportieren"
+  Ausgabe: "Wie exportiert man ein Straßen- oder Kanalmodell aus card_1 als IFC mit korrekter Attributierung für BIM-Workflows?"
+
+Wenn Informationen fehlen, **stelle KEINE Nachfragen** – gib die präziseste Suchanfrage ab, die aus der Eingabe ableitbar ist.
+"""
+
+def rewrite_card1_query(messy_query: str) -> str:
+    """Schickt die messy Query an die LLM und erhält den optimierten Suchsatz zurück."""
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": messy_query.strip()},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 200,
+    }
+
+    try:
+        resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+
+        data = resp.json()
+        # OpenAI-/Ollama-kompatibles Schema:
+        content = (
+            data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+        )
+        if not content:
+            raise ValueError(f"Leere Antwort: {json.dumps(data)[:400]}")
+        # Sicherheit: Nur eine Zeile ausgeben
+        return " ".join(content.split())
+    except Exception as e:
+        return f"[Fehler bei der Umschreibung: {e}]"
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        messy = " ".join(sys.argv[1:])
+    else:
+        messy = input("Messy Frage eingeben: ").strip()
+
+    optimized = rewrite_card1_query(messy)
+    print(optimized)
+
+Wie benutzen?
+
+Endpoint/Key/Modell anpassen (oder via Umgebungsvariablen LLM_API_URL, LLM_API_KEY, LLM_MODEL setzen).
+
+Dann z. B. ausführen:
+
+
+python correct_card1_query.py "Wie mache ich Profile in card1?"
+
+Ausgabe (Beispiel):
+
+Wie erzeugt man in card_1 aus einer bestehenden Straßenachse Querprofile und gibt sie als Plan oder 3D-Ansicht aus?
+
+Wenn du möchtest, passe die Themenliste im System-Prompt an eure card_1-Module/Funktionen an (z. B. weitere Exporte, interne Bezeichner, Firmennormen).
+
