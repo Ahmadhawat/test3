@@ -1,0 +1,197 @@
+You’re getting the [PARSE] Antwort war kein gültiges JSON because the model still replied in prose.
+Fix it in two layers:
+
+1. Ask for JSON hard (and use JSON mode if your server supports it).
+
+
+2. Be tolerant: try to extract/repair JSON if the model slips once.
+
+
+
+Below is a drop-in set:
+
+A. Stricter JSON system prompt
+
+STRICT_JSON_SYSTEM = """\
+Du bist ein Assistent für card_1.
+
+GIB AUSSCHLIESSLICH EIN MINIFIZIERTES JSON-OBJEKT ZURÜCK – OHNE MARKDOWN, OHNE TEXT DAVOR/DANACH.
+Schema (genau diese Schlüssel):
+{"answer": "<kurze Antwort in 3-4 Sätzen>", "ref": <integer>}
+
+- Wähle GENAU EINE beste Quelle aus den [n]-Quellen.
+- "ref" ist die Nummer dieser Quelle (Integer).
+- Wenn keine Quelle exakt passt, wähle die nächstbeste Nummer und sage das in "answer".
+- Keine weiteren Felder. Kein Markdown. Nur gültiges JSON.
+"""
+
+B. Build payload (unchanged idea, but ready for JSON mode)
+
+import textwrap
+from typing import Dict, Tuple, List
+
+def trim_sources_to_budget(loaded_files: Dict[str, str],
+                           top_k: int = 10,
+                           total_budget_chars: int = 80_000,
+                           min_per_src: int = 1500) -> List[Tuple[int, str, str]]:
+    items = list(loaded_files.items())[:top_k]
+    if not items:
+        return []
+    per_src = max(min_per_src, total_budget_chars // len(items))
+    return [(i, path, (text or "")[:per_src]) for i, (path, text) in enumerate(items, start=1)]
+
+def build_payload_json(query: str,
+                       loaded_files: Dict[str, str],
+                       model_name: str,
+                       *,
+                       system_prompt: str = STRICT_JSON_SYSTEM,
+                       top_k: int = 10,
+                       total_budget_chars: int = 80_000,
+                       temperature: float = 0.0,   # make it deterministic
+                       max_tokens: int = 400,
+                       use_json_mode: bool = True) -> Tuple[dict, Dict[int, str]]:
+    limited = trim_sources_to_budget(loaded_files, top_k, total_budget_chars)
+
+    evidence_blocks, index_map = [], {}
+    for idx, path, snippet in limited:
+        index_map[idx] = path
+        evidence_blocks.append(f"[{idx}] {path}\n--- BEGIN ---\n{snippet}\n--- END ---")
+
+    user_prompt = (
+        f"Frage: {query}\n\n"
+        "Nutze NUR die folgenden Quellen. Wähle die eine beste Quelle und antworte "
+        "AUSSCHLIESSLICH im geforderten JSON-Format.\n\nQuellen:\n" +
+        "\n\n".join(evidence_blocks)
+    )
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    # If your server supports OpenAI-style JSON mode, include this:
+    if use_json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    return payload, index_map
+
+C. Caller with JSON-mode, retry, and repair
+
+import json, re, requests
+from typing import Dict
+
+_JSON_RE = re.compile(r'\{.*\}', re.DOTALL)
+
+def _extract_json(text: str) -> dict | None:
+    # 1) try direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # 2) try to cut the first {...} block
+    m = _JSON_RE.search(text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
+
+def call_llm_and_print_json(api_url: str, api_key: str, payload: dict, index_map: Dict[int, str]) -> dict:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    def _post(p):
+        return requests.post(api_url, headers=headers, json=p, timeout=90)
+
+    # first try
+    resp = _post(payload)
+    if resp.status_code != 200:
+        msg = f"[HTTP {resp.status_code}] {resp.text[:500]}"
+        print(msg); return {"answer": "", "ref": None, "path": None}
+
+    data = resp.json()
+    content = (
+        data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        or ""
+    ).strip()
+
+    out = _extract_json(content)
+
+    # one retry if not JSON: enforce again, zero temperature, short instruction
+    if out is None:
+        print("[PARSE] Antwort war kein gültiges JSON. Rohtext (gekürzt):")
+        print(content[:600])
+        retry_payload = dict(payload)
+        retry_msgs = list(retry_payload["messages"])
+        retry_msgs.append({
+            "role": "user",
+            "content": (
+                "Deine letzte Ausgabe war kein JSON. Antworte JETZT ausschließlich als "
+                'minifiziertes JSON: {"answer":"...","ref":<int>}'
+            ),
+        })
+        retry_payload["messages"] = retry_msgs
+        retry_payload["temperature"] = 0.0
+        resp = _post(retry_payload)
+        if resp.status_code == 200:
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                or ""
+            ).strip()
+            out = _extract_json(content)
+
+    if out is None:
+        # still not JSON; return raw text as answer
+        print("\n===== LLM Antwort (roh) =====\n")
+        print(content)
+        return {"answer": content, "ref": None, "path": None}
+
+    ref = out.get("ref")
+    path = index_map.get(int(ref)) if isinstance(ref, int) else None
+
+    print("\n===== LLM Antwort =====\n")
+    print(out.get("answer", ""))
+    if path:
+        print(f"\nSource: [{ref}] {path}")
+    else:
+        print(f"\nSource: [{ref}] (keine Zuordnung gefunden)")
+
+    return {"answer": out.get("answer", ""), "ref": ref, "path": path}
+
+What changed / why it helps
+
+response_format={"type":"json_object"} (if your server supports it) forces JSON mode.
+
+temperature=0.0 reduces drift.
+
+Retry with a repair message if the first attempt isn’t JSON.
+
+Regex-based extraction salvages JSON if it’s wrapped in prose or code fences.
+
+We always print the file path by mapping ref → path locally.
+
+
+Use it with your existing loader and builder:
+
+loaded = load_files_from_json("workspace/hybrid_results.json")
+payload, index_map = build_payload_json(
+    query="Wie kann ich Querprofillinien bis zu einer bestimmten Station plotten?",
+    loaded_files=loaded,
+    model_name="llama3.3:latest",
+    top_k=10,
+    total_budget_chars=80_000,
+    use_json_mode=True,   # set False if your server doesn't support it
+)
+
+result = call_llm_and_print_json(API_URL, API_KEY, payload, index_map)
+
+This will keep the original query in the payload, and you’ll get a short answer + guaranteed reference path.
+
