@@ -1,158 +1,61 @@
-Got it ✅ — you already have a dict like:
-
-{
-   "C:\\...\\profile_0001.txt": ".... file contents ....",
-   "C:\\...\\profdemo_bahn.txt": ".... file contents ....",
-   ...
-}
-
-Now you want a function that:
-
-1. Takes this dict (from your loader).
-
-
-2. Builds a prompt with the query and the evidence (with source numbers).
-
-
-3. Returns the ready-to-send payload for your LLM API call.
-
-
-
-Here’s a clean implementation:
+Sweet — here’s a drop-in builder that uses the strict system prompt by default and still enforces top-k + budget.
 
 import textwrap
-
-def build_rag_payload(query: str,
-                      loaded_files: dict[str, str],
-                      model_name: str,
-                      system_prompt: str,
-                      max_ctx_chars: int = 80_000,
-                      temperature: float = 0.2,
-                      max_tokens: int = 800) -> dict:
-    """
-    Baut den Payload für die RAG-Generierung:
-    - query: die Nutzerfrage
-    - loaded_files: {path: content}
-    - system_prompt: Anweisung für das LLM
-    - Beschränkt den Gesamttext auf max_ctx_chars Zeichen
-    """
-
-    # --- trim context budget ---
-    per_src = max(1500, max_ctx_chars // max(1, len(loaded_files)))
-    blocks = []
-    for i, (path, text) in enumerate(loaded_files.items(), start=1):
-        snippet = (text or "")[:per_src]
-        block = textwrap.dedent(f"""\
-        [{i}] {path}
-        --- BEGIN ---
-        {snippet}
-        --- END ---
-        """).strip()
-        blocks.append(block)
-
-    evidence_block = "\n\n".join(blocks)
-
-    # --- user prompt ---
-    user_prompt = f"""\
-Frage: {query}
-
-Du erhältst bis zu {len(loaded_files)} Quellen mit Inhalten.
-Nutze NUR diese Quellen für deine Antwort und zitiere sie mit [n].
-Wenn Infos fehlen, sage das offen.
-
-Quellen:
-{evidence_block}
-"""
-
-    # --- payload ---
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    return payload
-
-
----
-
-Example usage
-
-SYSTEM_PROMPT = """\
-Du bist ein technischer Assistent für card_1.
-Beantworte Fragen präzise, fachlich korrekt, mit Inline-Referenzen [n].
-Am Ende eine Liste "Sources:" mit den verwendeten Quellen.
-"""
-
-files_dict = load_files_from_json("workspace/hybrid_results.json")
-payload = build_rag_payload(
-    query="Wie kann ich Querprofillinien bis zu einer bestimmten Station plotten?",
-    loaded_files=files_dict,
-    model_name="llama3.3:70b",
-    system_prompt=SYSTEM_PROMPT
-)
-
-print(payload.keys())
-
-
----
-
-👉 Do you also want me to add a post-processor that automatically appends a Sources: list based on the [n] references the model used?
-
-
-
-
-
-You’re right — I didn’t wire the limit into the payload builder. Here’s a version that uses a limit function to cap both the number of files (top-k) and the total context budget.
-
 from typing import Dict, List, Tuple
-import textwrap
+
+# --- Strict system prompt: short answer, single best reference ---
+STRICT_SYSTEM_PROMPT = """\
+Du bist ein technischer Assistent für card_1 (CAD/BIM für Vermessung & Infrastruktur).
+
+Regeln für deine Antwort:
+1. Lies die Nutzerfrage und die bereitgestellten Quellen sorgfältig.
+2. Wähle die EINE Quelle aus den Top-10, die am besten zur Frage passt.
+3. Formuliere eine kurze, fachlich korrekte Antwort (max. 3–4 Sätze).
+4. Gib IMMER die Referenznummer der gewählten Quelle in eckigen Klammern an (z. B. [3]).
+5. Wenn keine Quelle die Frage beantworten kann, antworte „Keine passende Information gefunden.“ und nenne die nächste am ehesten relevante Referenznummer.
+6. Füge am Ende eine Liste „Sources:“ an, die nur die verwendete Quelle zeigt, im Format:
+   Sources:
+   [n] <Dateipfad oder Chunkname>
+Wichtig: Keine zusätzlichen Erklärungen, keine Quellen ohne Nummer, keine erfundenen Informationen.
+"""
 
 def trim_sources_to_budget(loaded_files: Dict[str, str],
                            top_k: int = 10,
                            total_budget_chars: int = 80_000,
                            min_per_src: int = 1500) -> List[Tuple[int, str, str]]:
     """
-    Keep only the first top_k files (order is preserved from your retrieval),
-    and trim each file so the *total* evidence stays within total_budget_chars.
-    Returns a list of (index, path, snippet).
+    Keep only top_k items (preserving order) and trim each to fit a total char budget.
+    Returns [(index, path, snippet)] where index starts at 1.
     """
     items = list(loaded_files.items())[:top_k]
     if not items:
         return []
-
     per_src = max(min_per_src, total_budget_chars // len(items))
-    limited = []
-    for i, (path, text) in enumerate(items, start=1):
-        snippet = (text or "")[:per_src]
-        limited.append((i, path, snippet))
-    return limited
+    return [(i, path, (text or "")[:per_src]) for i, (path, text) in enumerate(items, start=1)]
 
-
-def build_rag_payload_with_limit(query: str,
-                                 loaded_files: Dict[str, str],
-                                 model_name: str,
-                                 system_prompt: str,
-                                 *,
-                                 top_k: int = 10,
-                                 total_budget_chars: int = 80_000,
-                                 temperature: float = 0.2,
-                                 max_tokens: int = 800) -> dict:
+def build_payload_strict_best_one(query: str,
+                                  loaded_files: Dict[str, str],
+                                  model_name: str,
+                                  *,
+                                  system_prompt: str = STRICT_SYSTEM_PROMPT,
+                                  top_k: int = 10,
+                                  total_budget_chars: int = 80_000,
+                                  temperature: float = 0.2,
+                                  max_tokens: int = 512) -> dict:
     """
-    Builds a ready-to-send payload for your LLM, using the limiter above.
+    Builds a ChatCompletion payload that:
+      - injects the strict system prompt,
+      - limits context to top_k sources and a total char budget,
+      - asks for a short answer with exactly one reference.
     """
-    limited_sources = trim_sources_to_budget(
+    limited = trim_sources_to_budget(
         loaded_files=loaded_files,
         top_k=top_k,
-        total_budget_chars=total_budget_chars,
+        total_budget_chars=total_budget_chars
     )
 
     evidence_blocks = []
-    for idx, path, snippet in limited_sources:
+    for idx, path, snippet in limited:
         block = textwrap.dedent(f"""\
         [{idx}] {path}
         --- BEGIN ---
@@ -164,14 +67,14 @@ def build_rag_payload_with_limit(query: str,
 
     user_prompt = f"""Frage: {query}
 
-Nutze NUR die folgenden Quellen und zitiere sie mit [n]. Wenn Informationen fehlen,
-sage das offen.
+Nutze NUR die untenstehenden Quellen. Wähle die beste einzelne Quelle und zitiere sie mit [n].
+Wenn nicht beantwortbar, gib das an und nenne die nächstbeste Referenznummer.
 
 Quellen:
 {evidence_block}
 """
 
-    payload = {
+    return {
         "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -180,19 +83,18 @@ Quellen:
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    return payload
 
-Use it like this:
+Example
 
-files_dict = load_files_from_json("workspace/hybrid_results.json")  # your loader
-payload = build_rag_payload_with_limit(
+# loaded_files = load_files_from_json("workspace/hybrid_results.json")  # your loader result
+payload = build_payload_strict_best_one(
     query="Wie kann ich Querprofillinien bis zu einer bestimmten Station plotten?",
-    loaded_files=files_dict,
+    loaded_files=loaded_files,
     model_name="llama3.3:70b",
-    system_prompt="Du bist ein technischer Assistent für card_1 ...",
     top_k=10,
-    total_budget_chars=80_000,  # ~20k tokens
+    total_budget_chars=80_000,  # ~20k tokens evidence cap
 )
+# requests.post(API_URL, headers={"Authorization": f"Bearer {API_KEY}", "Content-Type":"application/json"}, json=payload)
 
-This guarantees you never exceed your context window: it keeps only top-k files and trims each to fit a global evidence budget.
+This will prompt the model to return a short answer and exactly one reference like [3], plus a Sources block listing only that source.
 
