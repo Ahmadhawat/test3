@@ -1,0 +1,84 @@
+I see what happened 👍
+
+Right now your pipeline works like this:
+
+1. You load all the retrieved files (with your load_files_from_json function).
+
+
+2. You build a payload with build_payload_strict_best_one. That function includes each file as:
+
+[1] C:\...\profile_0001.txt
+--- BEGIN ---
+...content snippet...
+--- END ---
+
+
+3. You send that to the LLM.
+
+
+4. The LLM then chooses one snippet and answers.
+
+
+
+
+---
+
+Why your answer has no file path
+
+The model read the snippet (the text content from inside the file) and produced an answer directly from it.
+
+It didn’t include the [n] reference because it wasn’t strictly forced to — it just summarized the snippet.
+
+That’s why you see details like “Erzeugung der Gelände­linie…” but no reference path: it came from one of your loaded .txt/.htm sources.
+
+
+
+---
+
+How to fix (so you always see the reference)
+
+You need to make the system prompt stricter and reinforce the rule:
+
+Du bist ein technischer Assistent für card_1 (CAD/BIM für Vermessung & Infrastruktur).
+
+Sehr wichtige Regeln:
+1. Antworte kurz (max. 3–4 Sätze).
+2. Wähle GENAU EINE Quelle aus den Top-10, die am besten passt.
+3. Deine Antwort MUSS die Referenznummer in eckigen Klammern enthalten, z. B. [3].
+4. Am Ende schreibe immer:
+   Sources:
+   [n] <Dateipfad oder Chunkname>
+5. Wenn keine Quelle passt, antworte „Keine passende Information gefunden.“ und nenne die am ehesten passende Referenznummer.
+
+
+---
+
+Practical change in your code
+
+In build_payload_strict_best_one, make sure the user message also reminds the model:
+
+user_prompt = f"""Frage: {query}
+
+Nutze NUR die untenstehenden Quellen. 
+- Deine Antwort MUSS die passende Referenznummer [n] enthalten. 
+- Am Ende MUSS eine Sources-Liste stehen.
+
+Quellen:
+{evidence_block}
+"""
+
+
+---
+
+👉 That way the LLM is forced to always include something like:
+
+Antwort: Die Querprofillinien werden über die Stationsliste berechnet [2].
+
+Sources:
+[2] C:\...\strasse\profile\profile_0001.txt
+
+
+---
+
+Do you want me to rewrite your payload builder function so it enforces this automatically?
+
