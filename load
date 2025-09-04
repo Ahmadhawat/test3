@@ -1,0 +1,74 @@
+Perfect ✅ — let’s build a function that:
+
+Takes the path of your hybrid_results.json.
+
+Reads the JSON.
+
+Iterates through the "results" list.
+
+For each result, tries to load the .txt file ("filename in txt") first, and if not found, the "file path".
+
+If found, stores the content in a dict (for later use) and prints "File found: <path>".
+
+If not found, prints "File not found: <path>".
+
+
+Here’s the code:
+
+import os
+import json
+
+def load_files_from_json(json_path: str):
+    """
+    Liest die JSON-Datei mit Retrieval-Ergebnissen ein und versucht,
+    die zugehörigen Dateien zu laden.
+    Gibt ein Dict {path: content} zurück.
+    """
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    results = data.get("results", [])
+    loaded_files = {}
+
+    for res in results:
+        # Prefer the preprocessed TXT file
+        txt_path = res.get("filename in txt")
+        file_path = res.get("file path")
+
+        candidate_paths = [txt_path, file_path]
+        found = False
+
+        for path in candidate_paths:
+            if path and os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                        loaded_files[path] = content
+                        print(f"File found: {path}")
+                        found = True
+                        break
+                except Exception as e:
+                    print(f"[WARN] Error reading {path}: {e}")
+
+        if not found:
+            print(f"File not found: {txt_path or file_path}")
+
+    return loaded_files
+
+
+---
+
+Example usage
+
+files_data = load_files_from_json("workspace/hybrid_results.json")
+
+print(f"\nTotal loaded files: {len(files_data)}")
+for path, content in files_data.items():
+    print(f"{path}: {len(content)} characters")
+
+
+---
+
+👉 Do you want me to also limit the number of files (e.g., only the top 10 results from "results") so it directly fits into your RAG flow?
+
