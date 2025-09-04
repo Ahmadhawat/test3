@@ -1,0 +1,233 @@
+# rag_generate.py
+import json
+import os
+import textwrap
+import requests
+from typing import List, Dict, Any, Tuple
+
+# ---------- Config ----------
+DEFAULT_MAX_CTX_CHARS = 18000  # budget for evidence text sent to LLM
+TEMPERATURE = 0.2
+MAX_TOKENS = 800
+
+SYSTEM_PROMPT = """\
+Du bist ein technischer Assistent für card_1 (CAD/BIM Vermessung & Infrastruktur).
+Beantworte die Frage präzise und fachlich korrekt NUR auf Basis der bereitgestellten Quellen.
+Wenn Informationen fehlen, sag das offen.
+Nutze **Inline-Referenzen** in eckigen Klammern, z. B. [1], [2], passend zu den Quellennummern.
+Gib am Ende eine Liste 'Sources:' mit den Zuordnungen [n] → Dateipfad/Chunkname aus.
+Keine Erfindungen, keine externen Annahmen.
+"""
+
+USER_INSTRUCTIONS = """\
+Frage: {query}
+
+Du erhältst bis zu 10 Quellen im Format:
+[Nummer] Pfad | Chunkname
+--- Inhalt (gekürzt) ---
+
+Aufgaben:
+1) Antworte knapp, korrekt und schrittweise, wenn sinnvoll.
+2) Zitiere verwendete Aussagen mit den Nummern in eckigen Klammern (z. B. [3]).
+3) Nutze nur Quellen, die wirklich inhaltlich herangezogen wurden.
+4) Wenn nicht beantwortbar: erkläre, was fehlt, und nenne relevante Quellennummern.
+
+Quellen (Kontext):
+{evidence_block}
+
+Erstelle danach:
+- Antwort (mit Inline-Referenzen).
+- Sources: Liste der verwendeten Quellen im Format [n] Pfad (Chunkname).
+"""
+
+# ---------- Core ----------
+
+def _read_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _pick_top_files(results: List[Dict[str, Any]], k: int = 10) -> List[Dict[str, Any]]:
+    """Deduplicate by 'file path' (falls back to 'filename in txt') and keep order."""
+    seen = set()
+    picked = []
+    for r in results:
+        key = r.get("file path") or r.get("filename in txt") or r.get("chunkname")
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(r)
+        if len(picked) == k:
+            break
+    return picked
+
+def _load_evidence(result: Dict[str, Any]) -> Tuple[str, str, str]:
+    """
+    Returns (source_id, label, content_snippet)
+    label = "file path | chunkname"
+    """
+    file_path = result.get("file path") or ""
+    chunkname = result.get("chunkname") or ""
+    txt_path = result.get("filename in txt") or ""
+    label = f"{file_path} | {chunkname}".strip(" |")
+
+    content = ""
+    if txt_path and os.path.exists(txt_path):
+        try:
+            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            content = ""
+    # Fallback: if no TXT, try to read HTM/HTML as text (best-effort)
+    if not content and file_path and os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            content = ""
+
+    # Trim extremely long lines
+    content = "\n".join(line.strip() for line in content.splitlines())
+    return (file_path or chunkname or txt_path, label, content)
+
+def _build_evidence_block(picked: List[Dict[str, Any]], ctx_budget: int) -> Tuple[str, List[Dict[str, str]]]:
+    """
+    Build the string sent to the LLM + map of sources.
+    Returns (block, index_map) where index_map[i] has keys: number, path, chunkname, label
+    """
+    blocks = []
+    index_map = []
+    used_chars = 0
+
+    for i, r in enumerate(picked, start=1):
+        src_key, label, content = _load_evidence(r)
+        if not content:
+            # still include label so the model can mention the source if needed
+            snippet = "(Kein Inhalt geladen)"
+        else:
+            # keep per-source budget roughly proportional
+            per_src_budget = max(1000, ctx_budget // max(1, len(picked)))
+            snippet = content[:per_src_budget]
+
+        block = textwrap.dedent(f"""\
+        [{i}] {label}
+        --- BEGIN ---
+        {snippet}
+        --- END ---
+        """).strip()
+
+        if used_chars + len(block) > ctx_budget and blocks:
+            # stop when we'd exceed budget (but keep at least one)
+            break
+
+        blocks.append(block)
+        used_chars += len(block)
+        index_map.append({
+            "number": i,
+            "path": r.get("file path", ""),
+            "chunkname": r.get("chunkname", ""),
+            "label": label,
+        })
+
+    return "\n\n".join(blocks), index_map
+
+def _call_llm(api_url: str, api_key: str, model: str, system_prompt: str, user_prompt: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+    }
+    try:
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=90)
+    except requests.exceptions.RequestException as e:
+        return f"[Fehler] Keine Verbindung zum LLM: {e}"
+
+    if resp.status_code == 401:
+        return "[Fehler] Ungültiger/abgelaufener API-Key (401)."
+    if resp.status_code in (404, 405):
+        return f"[Fehler] Falsche API-URL oder Endpoint (HTTP {resp.status_code})."
+    if resp.status_code == 400 and "model" in resp.text.lower():
+        return "[Fehler] Ungültiger Modellname (400)."
+    if resp.status_code != 200:
+        return f"[Fehler] LLM-HTTP {resp.status_code}: {resp.text[:300]}"
+
+    data = resp.json()
+    content = (
+        data.get("choices", [{}])[0]
+           .get("message", {})
+           .get("content", "")
+           .strip()
+    )
+    return content or "[Fehler] Leere Antwort vom LLM."
+
+def generate_from_rag(
+    results_json_path: str,
+    api_url: str,
+    api_key: str,
+    model_name: str,
+    ctx_budget: int = DEFAULT_MAX_CTX_CHARS,
+) -> str:
+    """
+    - Reads top-10 results from a hybrid_results.json.
+    - Builds a compact evidence pack.
+    - Calls the LLM and returns the final answer string (with inline [n] refs + Sources list).
+    """
+    data = _read_json(results_json_path)
+    query = data.get("query", "").strip()
+    results = data.get("results", [])
+    if not results:
+        return "Keine Ergebnisse im Retrieve-Schritt. Bitte Frage oder Index prüfen."
+
+    picked = _pick_top_files(results, k=10)
+    evidence_block, index_map = _build_evidence_block(picked, ctx_budget)
+
+    user_prompt = USER_INSTRUCTIONS.format(
+        query=query,
+        evidence_block=evidence_block
+    )
+
+    answer = _call_llm(
+        api_url=api_url,
+        api_key=api_key,
+        model=model_name,
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=user_prompt
+    )
+
+    # If the model forgot the Sources list, append a best-effort one.
+    if "Sources:" not in answer:
+        sources_lines = ["Sources:"]
+        for m in index_map:
+            sources_lines.append(f"[{m['number']}] {m['label']}")
+        answer = f"{answer}\n\n" + "\n".join(sources_lines)
+
+    return answer
+
+
+# ---------- Example CLI usage ----------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results", default="workspace/hybrid_results.json")
+    parser.add_argument("--api_url", required=True)
+    parser.add_argument("--api_key", required=True)
+    parser.add_argument("--model", default="llama3.1:latest")
+    args = parser.parse_args()
+
+    output = generate_from_rag(
+        results_json_path=args.results,
+        api_url=args.api_url,
+        api_key=args.api_key,
+        model_name=args.model,
+    )
+    print("\n===== RAG Answer =====\n")
+    print(output)
