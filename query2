@@ -17,3 +17,79 @@ Regeln:
 
 Gib **nur die Suchanfrage** als Ausgabe.
 """
+
+
+import requests
+import json
+
+def rewrite_card1_query(messy_query: str, API_KEY: str, API_URL: str, MODEL_NAME: str) -> str:
+    """
+    Schickt die Query an die LLM-API und gibt die optimierte Suchanfrage zurück.
+    Fehlerfälle wie falscher API-Key, falsche Modellbezeichnung oder ungültige URL
+    werden abgefangen -> Rückfall auf die Original-Query.
+    """
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": messy_query.strip()},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 200,
+    }
+
+    try:
+        resp = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+
+        # --- Auth / API key error
+        if resp.status_code == 401:
+            print("[AUTH ERROR] Ungültiger oder abgelaufener API-Key.")
+            return messy_query.strip()
+
+        # --- Model not found / invalid parameter
+        if resp.status_code == 400 and "model" in resp.text.lower():
+            print(f"[MODEL ERROR] Ungültiger Modellname '{MODEL_NAME}'.")
+            return messy_query.strip()
+
+        # --- Not found / wrong API URL
+        if resp.status_code in (404, 405):
+            print(f"[URL ERROR] API-URL '{API_URL}' nicht erreichbar oder falsch.")
+            return messy_query.strip()
+
+        # --- Other HTTP errors
+        if resp.status_code != 200:
+            print(f"[HTTP ERROR] {resp.status_code}: {resp.text[:200]}")
+            return messy_query.strip()
+
+        # --- Success path
+        data = resp.json()
+        content = (
+            data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+        )
+
+        if not content:
+            print("[LLM ERROR] Leere Antwort vom Modell.")
+            return messy_query.strip()
+
+        return content
+
+    except requests.exceptions.MissingSchema:
+        print(f"[URL ERROR] Ungültige API-URL '{API_URL}'.")
+        return messy_query.strip()
+
+    except requests.exceptions.ConnectionError:
+        print(f"[CONNECTION ERROR] Keine Verbindung zur API unter '{API_URL}'.")
+        return messy_query.strip()
+
+    except Exception as e:
+        print(f"[EXCEPTION] Unerwarteter Fehler: {e}")
+        return messy_query.strip()
