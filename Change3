@@ -1,0 +1,175 @@
+You’re right: relying on prose instructions isn’t enough—some models will still ignore the “show Sources” rule.
+Best fix: force a structured output (JSON) so we can guarantee a reference and then map it to the path ourselves.
+
+Below are three small pieces:
+
+1. a stricter system prompt (JSON-only),
+
+
+2. a payload builder that includes the user query + sources,
+
+
+3. a caller that parses the JSON and prints the answer with the file path.
+
+
+
+
+---
+
+1) System prompt (JSON-only)
+
+STRICT_JSON_SYSTEM = """\
+Du bist ein technischer Assistent für card_1 (CAD/BIM für Vermessung & Infrastruktur).
+
+AUSGABEFORMAT (sehr wichtig):
+Gib deine Antwort AUSSCHLIESSLICH als gültiges JSON-Objekt zurück, ohne Vor- oder Nachtext:
+{"answer": "<kurze Antwort in 3-4 Sätzen>", "ref": <nummer>}
+
+Regeln:
+- Wähle GENAU EINE beste Quelle aus den bereitgestellten [n]-Quellen.
+- "ref" ist die Nummer n dieser Quelle (Integer, z. B. 3).
+- "answer" muss fachlich korrekt und kurz sein.
+- Wenn keine Quelle passt: setze "ref" auf die am ehesten passende Nummer und schreibe in "answer", dass keine exakte Info gefunden wurde.
+- Keine zusätzlichen Felder, keine Erklärungen, NUR das JSON.
+"""
+
+
+---
+
+2) Build payload (includes the user’s query)
+
+import textwrap
+from typing import Dict, Tuple, List
+
+def trim_sources_to_budget(loaded_files: Dict[str, str],
+                           top_k: int = 10,
+                           total_budget_chars: int = 80_000,
+                           min_per_src: int = 1500) -> List[Tuple[int, str, str]]:
+    items = list(loaded_files.items())[:top_k]
+    if not items:
+        return []
+    per_src = max(min_per_src, total_budget_chars // len(items))
+    return [(i, path, (text or "")[:per_src]) for i, (path, text) in enumerate(items, start=1)]
+
+def build_payload_json(query: str,
+                       loaded_files: Dict[str, str],
+                       model_name: str,
+                       *,
+                       system_prompt: str = STRICT_JSON_SYSTEM,
+                       top_k: int = 10,
+                       total_budget_chars: int = 80_000,
+                       temperature: float = 0.2,
+                       max_tokens: int = 400) -> Tuple[dict, Dict[int, str]]:
+    """
+    Returns (payload, index_map) where index_map maps ref number -> file path.
+    """
+    limited = trim_sources_to_budget(loaded_files, top_k, total_budget_chars)
+
+    evidence_blocks = []
+    index_map = {}
+    for idx, path, snippet in limited:
+        index_map[idx] = path
+        block = textwrap.dedent(f"""\
+        [{idx}] {path}
+        --- BEGIN ---
+        {snippet}
+        --- END ---""").strip()
+        evidence_blocks.append(block)
+
+    sources_text = "\n\n".join(evidence_blocks)
+
+    user_prompt = f"""Frage: {query}
+
+Nutze NUR die folgenden Quellen. Wähle die eine beste Quelle und gib das Ergebnis
+AUSSCHLIESSLICH im geforderten JSON-Format zurück.
+
+Quellen:
+{sources_text}
+"""
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    return payload, index_map
+
+> Note: This explicitly includes the query in the user message.
+
+
+
+
+---
+
+3) Call LLM, parse JSON, and print with path
+
+import json
+import requests
+
+def call_llm_and_print_json(api_url: str, api_key: str, payload: dict, index_map: Dict[int, str]) -> dict:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=90)
+
+    if resp.status_code != 200:
+        print(f"[HTTP {resp.status_code}] {resp.text[:500]}")
+        return {"answer": "", "ref": None, "path": None}
+
+    data = resp.json()
+    text = (
+        data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+    )
+
+    # The model MUST return JSON. If not, try to salvage.
+    try:
+        out = json.loads(text)
+    except json.JSONDecodeError:
+        print("[PARSE] Antwort war kein gültiges JSON. Rohtext:")
+        print(text[:800])
+        return {"answer": text, "ref": None, "path": None}
+
+    ref = out.get("ref")
+    path = index_map.get(int(ref)) if isinstance(ref, int) else None
+
+    print("\n===== LLM Antwort =====\n")
+    print(out.get("answer", ""))
+    if path:
+        print(f"\nSource: [{ref}] {path}")
+    else:
+        print(f"\nSource: [{ref}] (keine Zuordnung gefunden)")
+
+    # return structured for further use
+    return {"answer": out.get("answer", ""), "ref": ref, "path": path}
+
+
+---
+
+How to use
+
+# loaded_files = load_files_from_json("workspace/hybrid_results.json")  # your loader result
+
+payload, index_map = build_payload_json(
+    query="Wie kann ich Querprofillinien bis zu einer bestimmten Station plotten?",
+    loaded_files=loaded_files,
+    model_name="llama3.3:latest",
+    top_k=10,
+    total_budget_chars=80_000,
+)
+
+result = call_llm_and_print_json(API_URL, API_KEY, payload, index_map)
+
+This approach guarantees:
+
+The query is definitely in the payload.
+
+The model must output JSON with a single ref number.
+
+You always print the actual file path by mapping ref -> path locally, even if the model would have omitted paths in prose.
+
+
