@@ -1,0 +1,88 @@
+# search.py
+import argparse, json, os, sys
+import faiss
+import yaml
+import numpy as np
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    print("pip install sentence-transformers faiss-cpu pyyaml", file=sys.stderr)
+    raise
+
+def load_config(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def load_index(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"FAISS index not found: {path}")
+    return faiss.read_index(path)
+
+def load_metadata(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    # expect format: {"id_to_filename": {"0": "file.txt", "1": "...", ...}}
+    id2file = meta.get("id_to_filename", meta)
+    # keys may be strings -> normalize to int
+    return {int(k): v for k, v in id2file.items()}
+
+def embed_query(model_name: str, text: str, query_prefix: str = "query:"):
+    model = SentenceTransformer(model_name)
+    q = f"{query_prefix} {text}".strip()
+    emb = model.encode([q], normalize_embeddings=True)  # cosine = inner product
+    return emb.astype("float32")
+
+def read_chunk_text(root_dir: str, rel_path: str, preview_chars: int = 260):
+    # chunks are stored as text files relative to a txt/chunk folder
+    path = rel_path
+    if not os.path.isabs(path):
+        path = os.path.join(root_dir, rel_path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            t = f.read().strip()
+    except FileNotFoundError:
+        return f"(missing) {rel_path}"
+    t = " ".join(t.split())  # collapse whitespace
+    return (t[:preview_chars] + "…") if len(t) > preview_chars else t
+
+def main():
+    ap = argparse.ArgumentParser(description="Semantic search over FAISS chunks.")
+    ap.add_argument("query", type=str, help="your search query")
+    ap.add_argument("-k", "--top_k", type=int, default=10, help="number of results")
+    ap.add_argument("-c", "--config", default="config.yaml", help="path to config.yaml")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+
+    # ---- expected keys in config.yaml ----
+    # cfg["embedding"]["model_name"]             e.g. "intfloat/multilingual-e5-base"
+    # cfg["vector_index_dir"] or ["vector_index_path"]
+    # cfg["txt_dir"] (root folder of chunk text files)
+    # cfg["vector_metadata_path"] (path to vector_metadata.json)
+    model_name = cfg["embedding"]["model_name"]
+    query_prefix = cfg.get("query_prefix", "query:")
+    index_path = cfg.get("vector_index_path") or os.path.join(cfg["vector_index_dir"], "vector_index.faiss")
+    metadata_path = cfg.get("vector_metadata_path") or os.path.join(cfg["vector_index_dir"], "vector_metadata.json")
+    txt_root = cfg.get("txt_dir", ".")
+
+    index = load_index(index_path)
+    id2file = load_metadata(metadata_path)
+    q_emb = embed_query(model_name, args.query, query_prefix=query_prefix)
+
+    # search
+    scores, ids = index.search(q_emb, args.top_k)
+    scores, ids = scores[0], ids[0]
+
+    print("\nTop matches:")
+    for rank, (sid, sc) in enumerate(zip(ids, scores), 1):
+        if sid == -1:
+            continue
+        fname = id2file.get(int(sid), f"(unknown id {sid})")
+        preview = read_chunk_text(txt_root, fname)
+        print(f"\n#{rank}  score={sc:.4f}")
+        print(f"file: {fname}")
+        print(preview)
+
+if __name__ == "__main__":
+    main()
