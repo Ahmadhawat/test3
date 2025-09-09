@@ -1,25 +1,38 @@
-import os
-import glob
-import numpy as np
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Iterable, Optional
+you got it — here’s a single, complete script that searches your existing chunk .txt files with BM25 (keyword) + FAISS (semantic) and fuses the results.
+No NLTK required (uses a fast regex tokenizer). Drop it in as hybrid_search_from_chunks.py.
 
+# hybrid_search_from_chunks.py
+# Hybrid retrieval over chunked .txt files (BM25 + FAISS), no NLTK dependency.
+
+import os
+import re
+import glob
+import argparse
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Iterable
+
+import numpy as np
 from tqdm import tqdm
 from rank_bm25 import BM25Okapi
 import faiss
 from sentence_transformers import SentenceTransformer
 
-import nltk
-nltk.download('punkt', quiet=True)
-from nltk.tokenize import word_tokenize
+
+# ----------------------------
+# Tokenizer (no NLTK needed)
+# ----------------------------
+_token_re = re.compile(r"\b\w+\b", flags=re.UNICODE)
+
+def simple_tokenize(text: str) -> List[str]:
+    return _token_re.findall(text.lower())
 
 
 # ----------------------------
-# Utilities
+# File utils
 # ----------------------------
-def read_txt_files(folder: str, recursive: bool = False, encoding_guess: str = "utf-8") -> Tuple[List[str], List[str]]:
+def read_txt_files(folder: str, recursive: bool = False, encoding: str = "utf-8") -> Tuple[List[str], List[str]]:
     """
-    Reads all .txt files under `folder`.
+    Load all .txt files under `folder`.
     Returns: (texts, filenames) aligned by index.
     """
     pattern = "**/*.txt" if recursive else "*.txt"
@@ -27,7 +40,7 @@ def read_txt_files(folder: str, recursive: bool = False, encoding_guess: str = "
     texts, names = [], []
     for fp in files:
         try:
-            with open(fp, "r", encoding=encoding_guess, errors="ignore") as f:
+            with open(fp, "r", encoding=encoding, errors="ignore") as f:
                 txt = f.read().strip()
             if txt:
                 texts.append(txt)
@@ -37,10 +50,9 @@ def read_txt_files(folder: str, recursive: bool = False, encoding_guess: str = "
     return texts, names
 
 
-def batch(iterable: Iterable, n: int) -> Iterable[List]:
-    """Yield lists of size n from iterable."""
+def batch(it: Iterable, n: int) -> Iterable[List]:
     buf = []
-    for x in iterable:
+    for x in it:
         buf.append(x)
         if len(buf) == n:
             yield buf
@@ -69,20 +81,23 @@ class HybridRetriever:
         use_cosine: bool = True,
         embed_batch_size: int = 128,
         show_progress: bool = True,
+        ivf: int = 0,  # 0 = exact flat; >0 = IVF centroids count
     ):
         """
-        texts: chunk texts (each .txt file is one chunk)
+        texts: chunk texts (each .txt is one chunk)
         names: filenames aligned with `texts`
+        ivf:   number of IVF centroids (0 uses exact IndexFlat*)
         """
         assert len(texts) == len(names) and len(texts) > 0, "texts and names must align and be non-empty"
 
         self.texts = texts
         self.names = names
+        self.use_cosine = use_cosine
 
         # --- BM25 (sparse) ---
         if show_progress:
             print("Building BM25 index...")
-        self.tokens = [word_tokenize(t.lower()) for t in texts]
+        self.tokens = [simple_tokenize(t) for t in texts]
         self.bm25 = BM25Okapi(self.tokens, k1=bm25_k1, b=bm25_b)
 
         # --- Dense (SentenceTransformer + FAISS) ---
@@ -92,28 +107,50 @@ class HybridRetriever:
 
         if show_progress:
             print("Embedding chunks (dense vectors)...")
-
         embs = []
-        for mini in tqdm(batch(texts, embed_batch_size), disable=not show_progress, total=(len(texts) + embed_batch_size - 1)//embed_batch_size):
-            vecs = self.model.encode(mini, show_progress_bar=False, convert_to_numpy=True, batch_size=embed_batch_size, normalize_embeddings=False)
-            embs.append(vecs.astype("float32"))
+        for mini in tqdm(batch(texts, embed_batch_size),
+                         total=(len(texts) + embed_batch_size - 1) // embed_batch_size,
+                         disable=not show_progress):
+            vecs = self.model.encode(
+                mini,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                batch_size=embed_batch_size,
+                normalize_embeddings=False,
+            ).astype("float32")
+            embs.append(vecs)
         embs = np.vstack(embs).astype("float32")
+        self.embs = embs  # keep if you want to update the index later
 
-        self.use_cosine = use_cosine
-        if use_cosine:
-            # Normalize for cosine similarity (then use inner product)
+        d = embs.shape[1]
+        if self.use_cosine:
+            # normalize to use inner product as cosine similarity
             faiss.normalize_L2(embs)
-            self.index = faiss.IndexFlatIP(embs.shape[1])
+            metric = faiss.METRIC_INNER_PRODUCT
+            flat = faiss.IndexFlatIP(d)
         else:
-            self.index = faiss.IndexFlatL2(embs.shape[1])
+            metric = faiss.METRIC_L2
+            flat = faiss.IndexFlatL2(d)
 
-        self.index.add(embs)
+        if ivf and ivf > 0:
+            if show_progress:
+                print(f"Building IVF index with {ivf} centroids...")
+            quantizer = flat
+            index = faiss.IndexIVFFlat(quantizer, d, ivf, metric)
+            if not index.is_trained:
+                index.train(embs)
+            index.add(embs)
+            self.index = index
+        else:
+            if show_progress:
+                print("Building exact flat index...")
+            flat.add(embs)
+            self.index = flat
+
         if show_progress:
             print(f"Indexed {len(texts)} chunks.")
 
-    # ----------------------------
-    # Internal helpers
-    # ----------------------------
+    # ------------- helpers -------------
     @staticmethod
     def _minmax(scores: Dict[int, float]) -> Dict[int, float]:
         if not scores:
@@ -124,31 +161,31 @@ class HybridRetriever:
             return {k: 1.0 for k in scores}
         return {k: (v - vmin) / (vmax - vmin) for k, v in scores.items()}
 
-    def _bm25_topk(self, query: str, k: int) -> List<ScoredItem]:
-        q_tokens = word_tokenize(query.lower())
-        scores = self.bm25.get_scores(q_tokens)
-        if k >= len(scores):
+    # ------------- retrieval -------------
+    def _bm25_topk(self, query: str, k: int) -> List[ScoredItem]:
+        q_tokens = simple_tokenize(query)
+        scores = self.bm25.get_scores(q_tokens)  # shape (N,)
+        k = min(k, len(scores))
+        if k == len(scores):
             order = np.argsort(scores)[::-1]
         else:
-            # partial sort then exact sort among top-k
             cand = np.argpartition(scores, -k)[-k:]
             order = cand[np.argsort(scores[cand])[::-1]]
         return [ScoredItem(int(i), float(scores[i])) for i in order[:k]]
 
-    def _faiss_topk(self, query: str, k: int) -> List<ScoredItem]:
+    def _faiss_topk(self, query: str, k: int) -> List[ScoredItem]:
         q = self.model.encode([query], convert_to_numpy=True).astype("float32")
         if self.use_cosine:
             faiss.normalize_L2(q)
-            sims, idxs = self.index.search(q, min(k, len(self.texts)))
-            sims, idxs = sims[0], idxs[0]
-            return [ScoredItem(int(i), float(sims[j])) for j, i in enumerate(idxs)]
-        else:
-            dists, idxs = self.index.search(q, min(k, len(self.texts)))
-            dists, idxs = dists[0], idxs[0]
-            sims = -dists  # convert L2 distance to similarity
-            return [ScoredItem(int(i), float(sims[j])) for j, i in enumerate(idxs)]
+        k = min(k, len(self.texts))
+        sims, idxs = self.index.search(q, k)  # returns (1,k)
+        sims, idxs = sims[0], idxs[0]
+        # if metric is L2, sims are negative distances only if we negated; but we used IP for cosine
+        if not self.use_cosine:
+            sims = -sims  # turn distances into similarity (higher is better)
+        return [ScoredItem(int(i), float(sims[j])) for j, i in enumerate(idxs)]
 
-    def _rrf(self, lists: List[List<ScoredItem]], k: int, rrf_k: float = 60.0) -> List<ScoredItem]:
+    def _rrf(self, lists: List[List[ScoredItem]], k: int, rrf_k: float = 60.0) -> List[ScoredItem]:
         scores: Dict[int, float] = {}
         for lst in lists:
             for rank, it in enumerate(lst):
@@ -157,9 +194,7 @@ class HybridRetriever:
         out.sort(key=lambda x: x.score, reverse=True)
         return out[:k]
 
-    # ----------------------------
-    # Public search API
-    # ----------------------------
+    # ------------- public API -------------
     def search(
         self,
         query: str,
@@ -171,10 +206,11 @@ class HybridRetriever:
     ) -> List[Tuple[str, float, str]]:
         """
         Returns a ranked list of (filename, fused_score, text).
-
-        alpha: weight for FAISS after min-max normalization in [0,1]
-        use_rrf: if True, use Reciprocal Rank Fusion instead of weighted scores
+        alpha: 0..1 weight for FAISS after min-max normalization.
         """
+        if not query.strip():
+            return []
+
         bm25 = self._bm25_topk(query, k_bm25)
         faiss_ = self._faiss_topk(query, k_faiss)
 
@@ -182,13 +218,13 @@ class HybridRetriever:
             fused = self._rrf([bm25, faiss_], k_final)
             return [(self.names[it.idx], it.score, self.texts[it.idx]) for it in fused]
 
-        # Weighted fusion with min-max normalization
+        # Weighted fusion (min–max normalize to comparable scales)
         sparse = {it.idx: it.score for it in bm25}
-        dense = {it.idx: it.score for it in faiss_}
+        dense  = {it.idx: it.score for it in faiss_}
         sparse_n = self._minmax(sparse)
-        dense_n = self._minmax(dense)
-        all_ids = set(sparse_n) | set(dense_n)
+        dense_n  = self._minmax(dense)
 
+        all_ids = set(sparse_n) | set(dense_n)
         fused = []
         for i in all_ids:
             s = sparse_n.get(i, 0.0)
@@ -201,29 +237,37 @@ class HybridRetriever:
 
 
 # ----------------------------
-# CLI usage
+# CLI
 # ----------------------------
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Hybrid search over chunk .txt files (BM25 + FAISS).")
-    parser.add_argument("--folder", required=True, help="Path to folder containing .txt chunk files.")
-    parser.add_argument("--recursive", action="store_true", help="Search .txt files recursively.")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Weight for FAISS in [0,1].")
-    parser.add_argument("--k", type=int, default=5, help="Number of final results.")
-    parser.add_argument("--rrf", action="store_true", help="Use Reciprocal Rank Fusion instead of weighted.")
-    args = parser.parse_args()
+def main():
+    p = argparse.ArgumentParser(description="Hybrid search over chunk .txt files (BM25 + FAISS).")
+    p.add_argument("--folder", required=True, help="Path to folder containing .txt chunk files.")
+    p.add_argument("--recursive", action="store_true", help="Include subfolders.")
+    p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2", help="SentenceTransformer model.")
+    p.add_argument("--alpha", type=float, default=0.5, help="Fusion weight for FAISS (0=only BM25, 1=only FAISS).")
+    p.add_argument("--k", type=int, default=5, help="Number of final results to show.")
+    p.add_argument("--rrf", action="store_true", help="Use Reciprocal Rank Fusion instead of weighted fusion.")
+    p.add_argument("--ivf", type=int, default=0, help="Use IVF with this many centroids (0 = exact flat).")
+    args = p.parse_args()
 
     texts, names = read_txt_files(args.folder, recursive=args.recursive)
     if not texts:
         raise SystemExit("No .txt files found. Check the folder path or file extensions.")
 
-    retriever = HybridRetriever(texts, names)
+    retriever = HybridRetriever(
+        texts,
+        names,
+        model_name=args.model,
+        ivf=args.ivf,
+        show_progress=True,
+    )
 
-    print("\nHybrid search ready. Type your query (or blank to exit):")
+    print("\nHybrid search ready. Type your query (blank to exit):")
     while True:
         try:
             q = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
+            print()
             break
         if not q:
             break
@@ -232,20 +276,31 @@ if __name__ == "__main__":
 
         print("\nTop results:")
         for i, (fname, score, text) in enumerate(results, 1):
-            preview = text.replace("\n", " ")[:160]
-            if len(text) > 160:
-                preview += "..."
-            print(f"{i:>2}. {fname} | score={score:.4f}")
+            base = os.path.basename(fname)
+            preview = text.replace("\n", " ")[:160] + ("..." if len(text) > 160 else "")
+            print(f"{i:>2}. {base} | score={score:.4f}")
             print(f"    {preview}")
         print()
 
+if __name__ == "__main__":
+    main()
 
-3) How to run
+How to run
 
-Basic (non-recursive, 5 results, 50/50 weighting):
+pip install rank-bm25 faiss-cpu sentence-transformers numpy tqdm
+python hybrid_search_from_chunks.py --folder /path/to/chunking_files --k 10 --alpha 0.6
+# add --recursive if your chunks are in subfolders
+# try IVF for big corpora:
+# python hybrid_search_from_chunks.py --folder /path --ivf 1024
 
-python hybrid_search_from_chunks.py --folder /path/to/chunking_files --k 5 --alpha 0.5
+What it does
 
-Recursive (search subfolders too) and use RRF:
+reads every .txt chunk → builds BM25 and FAISS indexes
 
-python hybrid_search_from_chunks.py --folder /path/to/chunking_files --recursive --k 10 --rrf
+query runs through both → results fused (weighted by --alpha or --rrf)
+
+prints filename, fused score, preview
+
+
+If you hit any errors, paste the first traceback line and I’ll zero in on it.
+
