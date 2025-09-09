@@ -1,0 +1,12 @@
+ix = whoosh_index.open_dir(lroot)
+with ix.searcher(weighting=BM25F()) as searcher:
+    analyzer = ix.schema["text"].analyzer
+    tokens = [tok.text for tok in analyzer(qtext) if tok.text]
+
+    if tokens:
+        q = Q.Or([Q.Term("text", t) for t in tokens])
+    else:
+        q = Q.Every()
+
+    hits = searcher.search(q, limit=k_lex)
+    lex_scores: Dict[int, float] = {int(h["doc_id"]): float(h.score) for h in hits}
