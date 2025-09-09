@@ -1,0 +1,104 @@
+Totally fine! You’ve got two easy options:
+
+Quick & dirty (still builds FAISS)
+
+Run your hybrid script with BM25-only scoring by setting alpha to 0:
+
+python hybrid_search_from_chunks.py --folder /path/to/chunks --alpha 0
+
+(This skips FAISS in the final score, but it still spends time building embeddings and the FAISS index.)
+
+
+---
+
+Fast & lightweight (no FAISS at all)
+
+Use this BM25-only script—no embeddings, no FAISS.
+
+Install
+
+pip install rank-bm25 tqdm
+
+bm25_only_search.py
+
+import os
+import re
+import glob
+import argparse
+from typing import List, Tuple
+
+import numpy as np
+from tqdm import tqdm
+from rank_bm25 import BM25Okapi
+
+# --- simple tokenizer (no NLTK) ---
+_token_re = re.compile(r"\b\w+\b", flags=re.UNICODE)
+def simple_tokenize(text: str) -> List[str]:
+    return _token_re.findall(text.lower())
+
+def read_txt_files(folder: str, recursive: bool = False, encoding: str = "utf-8") -> Tuple[List[str], List[str]]:
+    pattern = "**/*.txt" if recursive else "*.txt"
+    files = sorted(glob.glob(os.path.join(folder, pattern), recursive=recursive))
+    texts, names = [], []
+    for fp in files:
+        try:
+            with open(fp, "r", encoding=encoding, errors="ignore") as f:
+                txt = f.read().strip()
+            if txt:
+                texts.append(txt)
+                names.append(fp)
+        except Exception as e:
+            print(f"[warn] Could not read {fp}: {e}")
+    return texts, names
+
+def main():
+    p = argparse.ArgumentParser(description="BM25-only search over chunk .txt files.")
+    p.add_argument("--folder", required=True, help="Path to folder containing .txt chunk files.")
+    p.add_argument("--recursive", action="store_true", help="Include subfolders.")
+    p.add_argument("--k", type=int, default=5, help="Number of results to show.")
+    p.add_argument("--k1", type=float, default=1.5, help="BM25 k1.")
+    p.add_argument("--b", type=float, default=0.75, help="BM25 b.")
+    args = p.parse_args()
+
+    texts, names = read_txt_files(args.folder, recursive=args.recursive)
+    if not texts:
+        raise SystemExit("No .txt files found.")
+
+    print("Building BM25 index...")
+    tokens = [simple_tokenize(t) for t in tqdm(texts)]
+    bm25 = BM25Okapi(tokens, k1=args.k1, b=args.b)
+
+    print("\nBM25 search ready. Type your query (blank to exit):")
+    while True:
+        try:
+            q = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not q:
+            break
+
+        q_tokens = simple_tokenize(q)
+        scores = bm25.get_scores(q_tokens)  # array len N
+        k = min(args.k, len(scores))
+        order = np.argsort(scores)[::-1][:k]
+
+        print("\nTop results:")
+        for rank, i in enumerate(order, 1):
+            fname = os.path.basename(names[i])
+            score = float(scores[i])
+            preview = texts[i].replace("\n", " ")[:160] + ("..." if len(texts[i]) > 160 else "")
+            print(f"{rank:>2}. {fname} | bm25={score:.4f}")
+            print(f"    {preview}")
+        print()
+
+if __name__ == "__main__":
+    main()
+
+Usage
+
+python bm25_only_search.py --folder /path/to/chunking_files --k 10
+# add --recursive if needed
+
+Output: a ranked list of your chunk filenames with their BM25 scores and a short preview—no embedding overhead.
+
