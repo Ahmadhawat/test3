@@ -238,3 +238,14 @@ if __name__ == "__main__":
             print(f"{i:>2}. {fname} | score={score:.4f}")
             print(f"    {preview}")
         print()
+
+
+3) How to run
+
+Basic (non-recursive, 5 results, 50/50 weighting):
+
+python hybrid_search_from_chunks.py --folder /path/to/chunking_files --k 5 --alpha 0.5
+
+Recursive (search subfolders too) and use RRF:
+
+python hybrid_search_from_chunks.py --folder /path/to/chunking_files --recursive --k 10 --rrf
