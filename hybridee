@@ -1,0 +1,247 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Tuple
+import json
+import os
+import re
+
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
+
+from src.steps.hybrid_search_impls.CHybridSearchA5 import hybridSearch
+from src.pipeline.Context import Context
+from src.utils.logging import get_logger
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def l2_normalize(v: np.ndarray) -> np.ndarray:
+    v = v.astype("float32")
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    n = np.maximum(n, 1e-12)
+    return v / n
+
+def _is_ivf(idx) -> bool:
+    return isinstance(
+        idx,
+        (faiss.IndexIVFFlat, faiss.IndexIVFPQ, faiss.IndexIVFScalarQuantizer),
+    )
+
+def _minmax(scores: Dict[int, float]) -> Dict[int, float]:
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    lo, hi = min(vals), max(vals)
+    if hi - lo <= 1e-12:
+        return {k: 1.0 for k in scores}
+    return {k: (v - lo) / (hi - lo) for k, v in scores.items()}
+
+def _rff(rank: int, k: int = 60) -> float:
+    return 1.0 / (k + rank)
+
+_CHUNK_SUFFIX_RE = re.compile(r"_chunk\d{4}\.txt$", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
+
+def chunk_to_real_path(chunk_filename: str, source_html_root: str | None = None) -> str:
+    rel = chunk_filename.replace("\\", "/")
+    rel = _CHUNK_SUFFIX_RE.sub(".htm", rel)
+    rel = rel.replace("/", os.sep)
+    return os.path.join(source_html_root, rel) if source_html_root else rel
+
+def chunk_to_real_txt(chunk_filename: str, source_html_root: str | None = None) -> str:
+    rel = chunk_filename.replace("\\", "/")
+    rel = _CHUNK_SUFFIX_RE.sub(".txt", rel)
+    rel = rel.replace("/", os.sep)
+    return os.path.join(source_html_root, rel) if source_html_root else rel
+
+# Optional: simple German stopwords
+DEFAULT_STOPWORDS = {
+    "und","oder","aber","wie","wo","was","wann","warum","ist","sind","ein","eine","einer",
+    "der","die","das","den","dem","des","zu","mit","ohne","auf","im","in","am","an","bis",
+    "nur","auch","ich","du","er","sie","es","wir","ihr","kann","können","kannst",
+    "für","von","vom","beim","zum","zur"
+}
+
+def simple_tokenize(text: str, stopwords: set[str] | None = None) -> List[str]:
+    toks = [t.lower() for t in _TOKEN_RE.findall(text)]
+    if stopwords:
+        toks = [t for t in toks if t not in stopwords]
+    return toks
+
+# -----------------------------
+# Hybrid search implementation
+# -----------------------------
+
+class CHybridSearchV1(hybridSearch):
+    name = "chybridsearchv1"
+
+    def _load_meta_id2name(self, meta_path: Path) -> Dict[int, str]:
+        raw_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        id2name: Dict[int, str] = {}
+        if isinstance(raw_meta, dict) and "id_to_name" in raw_meta:
+            id2name = {int(k): str(v) for k, v in raw_meta["id_to_name"].items()}
+        elif isinstance(raw_meta, dict):
+            try:
+                id2name = {int(k): str(v) for k, v in raw_meta.items()}
+            except Exception:
+                pass
+        elif isinstance(raw_meta, list):
+            for m in raw_meta:
+                if not isinstance(m, dict):
+                    continue
+                did = int(m.get("id"))
+                name = (
+                    m.get("chunkname") or m.get("filename") or m.get("file") or m.get("name") or ""
+                )
+                id2name[did] = str(name)
+        return id2name
+
+    def run(self, ctx: Context) -> None:
+        log = get_logger(self.name)
+
+        # -------- Paths & config --------
+        vroot = Path(ctx.cfg["paths"]["vector_dataset_dir"])
+        index_path = vroot / "vector_index.faiss"
+        meta_path = vroot / "vector_metadata.json"
+        if not index_path.exists() or not meta_path.exists():
+            log.error("Missing FAISS index or metadata in %s", vroot)
+            return
+
+        qcfg = ctx.cfg.get("query", {}) or {}
+        fcfg = ctx.cfg.get("fusion", {}) or {}
+        ecfg = ctx.cfg.get("embedding", {}) or {}
+
+        k = int(qcfg.get("k", 10))
+        k_vec = int(qcfg.get("k_vec", 30))
+        k_lex = int(qcfg.get("k_lex", 30))
+        method = str(fcfg.get("method", "minmax")).lower()
+        alpha = float(fcfg.get("alpha", 0.5))
+
+        qtext = ctx.artifacts.get("corrected_query") or qcfg.get("text")
+        if not qtext:
+            log.error("No query text provided")
+            return
+
+        # -------- Embedder --------
+        model_name = ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2")
+        cache_folder = ecfg.get("cache_folder", "./data/models/st")
+        embedder = SentenceTransformer(model_name, cache_folder=cache_folder)
+
+        e5 = ctx.cfg.get("e5_prefixes", {}) or {}
+        use_e5 = bool(e5.get("use", False))
+        qprefix = e5.get("query_prefix", "query: ")
+
+        # -------- FAISS search --------
+        index = faiss.read_index(str(index_path))
+        if _is_ivf(index):
+            nprobe = int(ctx.cfg.get("faiss", {}).get("nprobe", 32))
+            try:
+                faiss.ParameterSpace().set_index_parameter(index, "nprobe", nprobe)
+            except Exception:
+                try:
+                    index.nprobe = nprobe
+                except Exception:
+                    pass
+
+        q_in = f"{qprefix}{qtext}" if use_e5 else qtext
+        qv = embedder.encode([q_in], show_progress_bar=False)
+        qv = l2_normalize(np.asarray(qv, dtype="float32"))
+
+        D, I = index.search(qv, k_vec)
+        vec_scores: Dict[int, float] = {
+            int(doc_id): float(score)
+            for doc_id, score in zip(I[0].tolist(), D[0].tolist())
+            if doc_id != -1
+        }
+
+        # -------- BM25 (rank_bm25, no cache) --------
+        source_html_root = r"C:\Entwicklung\IAAEntwicklung\KI1\CIH\Help"
+        source_txt_root  = r"C:\Entwicklung\IAAEntwicklung\KI1\upload\Daten\workspace\txt_files"
+
+        id2name = self._load_meta_id2name(meta_path)
+        tokenized_docs, docid_list = [], []
+        for did, chunkname in id2name.items():
+            txt_path = chunk_to_real_txt(chunkname, source_html_root=source_txt_root)
+            try:
+                txt = Path(txt_path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            toks = simple_tokenize(txt, stopwords=DEFAULT_STOPWORDS)
+            if toks:
+                docid_list.append(did)
+                tokenized_docs.append(toks)
+
+        if not tokenized_docs:
+            log.warning("No docs available for BM25")
+            lex_scores = {}
+        else:
+            bm25 = BM25Okapi(tokenized_docs)
+            q_tokens = simple_tokenize(qtext, stopwords=DEFAULT_STOPWORDS)
+            if not q_tokens:
+                lex_scores = {}
+            else:
+                scores = bm25.get_scores(q_tokens)
+                k_lex = min(k_lex, len(scores))
+                top_idx = np.argpartition(-scores, kth=k_lex-1)[:k_lex]
+                lex_scores = {int(docid_list[i]): float(scores[i]) for i in top_idx}
+
+        # -------- Fusion --------
+        all_ids = set(vec_scores) | set(lex_scores)
+        fused_pairs: List[Tuple[int, float]] = []
+        if method == "rrf":
+            vec_sorted = sorted(vec_scores.items(), key=lambda x: x[1], reverse=True)
+            lex_sorted = sorted(lex_scores.items(), key=lambda x: x[1], reverse=True)
+            vec_rank = {doc_id: r for r, (doc_id, _) in enumerate(vec_sorted, start=1)}
+            lex_rank = {doc_id: r for r, (doc_id, _) in enumerate(lex_sorted, start=1)}
+            for did in all_ids:
+                s = _rff(vec_rank.get(did, 10**9)) + _rff(lex_rank.get(did, 10**9))
+                fused_pairs.append((did, s))
+        else:
+            vnorm = _minmax(vec_scores)
+            lnorm = _minmax(lex_scores)
+            for did in all_ids:
+                s = alpha * vnorm.get(did, 0.0) + (1.0 - alpha) * lnorm.get(did, 0.0)
+                fused_pairs.append((did, s))
+
+        fused_pairs.sort(key=lambda x: x[1], reverse=True)
+        top_ids = [did for did, _ in fused_pairs[:k]]
+
+        # -------- Attach metadata & write JSON --------
+        results: List[dict] = []
+        fused_map = dict(fused_pairs)
+
+        def meta_get(did: int) -> str:
+            return id2name.get(did, "")
+
+        for did in top_ids:
+            chunkname = meta_get(did)
+            filepath = chunk_to_real_path(chunkname, source_html_root=source_html_root)
+            filetxt  = chunk_to_real_txt(chunkname, source_html_root=source_txt_root)
+
+            results.append(
+                {
+                    "doc_id": int(did),
+                    "chunkname": chunkname,
+                    "filename in txt": filetxt,
+                    "file_path": filepath,
+                    "scores": {
+                        "vector": float(vec_scores.get(did, 0.0)),
+                        "lexical": float(lex_scores.get(did, 0.0)),
+                        "hybrid": float(fused_map.get(did, 0.0)),
+                    },
+                }
+            )
+
+        out_path = Path(ctx.cfg["paths"].get("hybrid_results_path", "./data/workspace/hybrid_results.json"))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps({"query": qtext, "results": results}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        log.info("Hybrid top-%d written to %s", k, out_path)
+        ctx.artifacts["hybrid_results_path"] = str(out_path)
