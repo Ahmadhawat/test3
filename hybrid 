@@ -1,0 +1,277 @@
+You’re super close—the issue isn’t “BM25 not working,” it’s how the Whoosh query is parsed and (likely) how the field was indexed. Multi-word queries only matching when there’s one word almost always means one (or both) of these:
+
+1. The field was indexed as KEYWORD (no tokenization), so "two words" is stored as a single token and only exact phrase hits work.
+
+
+2. The parser/grouping/weighting isn’t set up for BM25 + multi-term matching (defaults can be strict AND, or not use BM25 at all).
+
+
+
+Below are drop-in fixes you can make right in your code (and a schema note in case the index is built with KEYWORD).
+
+
+---
+
+✅ Minimal code changes in your file
+
+Add imports near the top:
+
+from whoosh import scoring
+from whoosh.qparser import QueryParser, OrGroup  # OrGroup is important for multi-word queries
+
+Replace your BM25 / Whoosh search block with this (exactly):
+
+# -------- BM25 / Whoosh search --------
+wix = whoosh_index.open_dir(str(lroot))
+
+# Use BM25F weighting (set K1/B to taste)
+bm25 = scoring.BM25F(B=0.75, K1=1.5)
+
+# open a searcher with BM25 weighting
+searcher = wix.searcher(weighting=bm25)
+
+try:
+    # Use OR grouping so multi-word queries don't require all words to be present
+    parser = QueryParser("text", schema=wix.schema, group=OrGroup.factory(0.9))
+    q = parser.parse(qtext)
+except Exception:
+    # very defensive fallback
+    from whoosh.query import Every
+    q = Every()
+
+hits = searcher.search(q, limit=k_lex)
+lex_scores: Dict[int, float] = {int(h["doc_id"]): float(h.score) for h in hits}
+
+Why this works
+
+searcher(weighting=scoring.BM25F(...)) actually turns on BM25 scoring (otherwise you’re on the default scoring).
+
+OrGroup lets multi-word queries retrieve docs that match any of the words (with good BM25 ranking). If you prefer strict AND but still want multi-term to work, keep AndGroup but you’ll need proper tokenization in the index (see schema note below).
+
+
+
+---
+
+🧪 Optional: bullet-proof multi-term even if the parser chokes
+
+If you don’t trust inputs (or suspect odd characters), you can build an OR query using the field’s own analyzer:
+
+from whoosh.query import Or, Term
+
+field = "text"
+analyzer = wix.schema[field].analyzer
+tokens = [t.text for t in analyzer(qtext)]
+if tokens:
+    q = Or([Term(field, tok) for tok in tokens])
+else:
+    from whoosh.query import Every
+    q = Every()
+
+Use this q instead of parser.parse(...) if you prefer.
+
+
+---
+
+🔧 Important schema check (do this where you build the index)
+
+If your schema uses KEYWORD for the content field, multi-word queries won’t tokenize. Make sure it’s a TEXT field (with an analyzer). Example:
+
+from whoosh.fields import Schema, TEXT, ID, STORED
+from whoosh.analysis import StemmingAnalyzer  # or StandardAnalyzer()
+
+schema = Schema(
+    doc_id=ID(stored=True, unique=True),
+    text=TEXT(stored=False, analyzer=StemmingAnalyzer(), phrase=True)
+)
+
+Use TEXT, not KEYWORD, for your searchable body field.
+
+Set phrase=True if you want quoted phrases to work efficiently.
+
+Rebuild the index if you change the schema (old postings won’t retro-convert).
+
+
+
+---
+
+⚖️ Tuning tips
+
+Start with K1=1.5, B=0.75 and tweak based on your corpus length variance.
+
+If you prefer “match more results first,” keep OrGroup. If you want “must contain all terms,” use the default AndGroup but only if your field tokenizes (TEXT).
+
+Hybrid fusion already min-max/rrf’s scores; BM25F tends to blend nicely as long as the lexical side returns any candidates for multi-word queries.
+
+
+
+---
+
+Quick checklist
+
+[ ] Field text is TEXT with an analyzer (not KEYWORD).
+
+[x] searcher = wix.searcher(weighting=scoring.BM25F(...))
+
+[x] QueryParser(..., group=OrGroup.factory(0.9)) or manual token OR query.
+
+[x] Keep your existing fusion code unchanged.
+
+
+If you want, paste your index-building code/schema and I’ll align it exactly to your setup.
+
+
+
+
+Great—here’s a complete, working setup you can drop in, even if you can’t (yet) share your index-building code. It covers:
+
+1. the exact BM25 + multi-term parser changes for your current file,
+
+
+2. a clean index-building script (TEXT field with tokenization),
+
+
+3. quick tests to confirm multi-word queries work.
+
+
+
+
+---
+
+1) Drop-in change in CHybridSearchV1.py (BM25 + OR parsing)
+
+Replace your Whoosh block with this:
+
+# -------- BM25 / Whoosh search --------
+from whoosh import scoring
+from whoosh.qparser import QueryParser, OrGroup
+from whoosh.query import Every
+
+wix = whoosh_index.open_dir(str(lroot))
+
+# Turn on real BM25 scoring
+bm25 = scoring.BM25F(B=0.75, K1=1.5)
+
+with wix.searcher(weighting=bm25) as searcher:
+    try:
+        # OR grouping -> multi-word queries match any term and rank well by BM25
+        parser = QueryParser("text", schema=wix.schema, group=OrGroup.factory(0.9))
+        q = parser.parse(qtext)
+    except Exception:
+        q = Every()
+
+    hits = searcher.search(q, limit=k_lex)
+    lex_scores: Dict[int, float] = {int(h["doc_id"]): float(h.score) for h in hits}
+
+This alone fixes the “only works with one word” symptom if your text field is properly tokenized in the index.
+
+
+---
+
+2) If you need (re)building the index, use this
+
+Create a small script (e.g. build_whoosh_index.py) that indexes your documents with a TEXT field (tokenized), not KEYWORD. Adjust the data loader to your files.
+
+# build_whoosh_index.py
+from pathlib import Path
+from whoosh import index
+from whoosh.fields import Schema, TEXT, ID, NUMERIC
+from whoosh.analysis import StandardAnalyzer
+import os
+import json
+
+def build_index(source_txt_dir: str, index_dir: str):
+    index_path = Path(index_dir)
+    index_path.mkdir(parents=True, exist_ok=True)
+
+    schema = Schema(
+        doc_id=NUMERIC(stored=True, unique=True),   # must align with your search code
+        path=ID(stored=True),
+        text=TEXT(stored=False, analyzer=StandardAnalyzer(), phrase=True),
+    )
+
+    if index.exists_in(index_dir):
+        ix = index.open_dir(index_dir)
+    else:
+        ix = index.create_in(index_dir, schema)
+
+    writer = ix.writer(limitmb=512, procs=1, multisegment=True)
+
+    # Example: enumerate .txt files; assign an integer doc_id that matches your FAISS metadata
+    # If you already have a mapping file (vector_metadata.json), prefer using those IDs here!
+    doc_id = 0
+    for p in Path(source_txt_dir).rglob("*.txt"):
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        writer.add_document(doc_id=doc_id, path=str(p), text=text)
+        doc_id += 1
+
+    writer.commit(optimize=True)
+    print(f"Indexed {doc_id} documents into {index_dir}")
+
+if __name__ == "__main__":
+    # set these to your actual dirs
+    build_index(
+        source_txt_dir=r"C:\Entwicklung\IAAEntwicklung\KI1\upload\Daten\workspace\txt_files",
+        index_dir=r"C:\Entwicklung\IAAEntwicklung\KI1\lexical_index"
+    )
+
+Important: your hybrid search expects that the Whoosh doc_id matches FAISS document IDs. If you already have a vector_metadata.json mapping, read it here and use the same IDs when calling writer.add_document(...). (If IDs don’t align, hybrid fusion will still run but will fuse unrelated docs.)
+
+
+---
+
+3) Quick sanity checks (before running the pipeline)
+
+A. Verify the field tokenizes multi-word input
+
+from whoosh import index
+ix = index.open_dir(r"C:\Entwicklung\IAAEntwicklung\KI1\lexical_index")
+an = ix.schema["text"].analyzer
+print([t.text for t in an("multi word query here")])
+# Expect: ['multi','word','query','here']  (or lowercased equivalents)
+
+If you get a single token like 'multi word query here', your field is not TEXT/tokenized—rebuild with TEXT(...).
+
+B. Probe a query directly
+
+from whoosh import index, scoring
+from whoosh.qparser import QueryParser, OrGroup
+ix = index.open_dir(r"C:\Entwicklung\IAAEntwicklung\KI1\lexical_index")
+with ix.searcher(weighting=scoring.BM25F()) as s:
+    q = QueryParser("text", ix.schema, group=OrGroup.factory(0.9)).parse("multi word query")
+    print(s.search(q, limit=5))
+
+You should see results even if not all words co-occur, with sensible BM25 scores.
+
+
+---
+
+4) If you can’t rebuild now, use a robust OR query
+
+This bypasses the parser and uses the index’s analyzer to build an OR of tokens:
+
+from whoosh.query import Or, Term
+field = "text"
+analyzer = wix.schema[field].analyzer
+tokens = [t.text for t in analyzer(qtext)]
+q = Or([Term(field, tok) for tok in tokens]) if tokens else Every()
+
+Drop that q into the BM25 block. It’s very forgiving for noisy inputs.
+
+
+---
+
+5) Optional tuning
+
+Keep K1=1.5, B=0.75 as a strong default.
+
+If you want stricter matching, switch OrGroup.factory(0.9) to OrGroup.factory(0.2) (lower = less OR looseness), or to the default AND group after you’ve confirmed tokenization works.
+
+
+
+---
+
+If you share how your vector_metadata.json maps IDs → filenames (or the script that built FAISS + Whoosh), I can line up the doc_id assignment so lexical and vector hits fuse perfectly.
+
