@@ -1,169 +1,240 @@
-# hybrid_retrieval.py
+import os
+import glob
 import numpy as np
-from typing import List, Tuple, Dict
 from dataclasses import dataclass
+from typing import List, Tuple, Dict, Iterable, Optional
 
-# --- BM25 (sparse) ---
+from tqdm import tqdm
 from rank_bm25 import BM25Okapi
-
-# --- Dense embeddings ---
 import faiss
 from sentence_transformers import SentenceTransformer
 
-# --- Simple tokenizer (swap for spaCy or custom if you like) ---
 import nltk
 nltk.download('punkt', quiet=True)
 from nltk.tokenize import word_tokenize
 
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def read_txt_files(folder: str, recursive: bool = False, encoding_guess: str = "utf-8") -> Tuple[List[str], List[str]]:
+    """
+    Reads all .txt files under `folder`.
+    Returns: (texts, filenames) aligned by index.
+    """
+    pattern = "**/*.txt" if recursive else "*.txt"
+    files = sorted(glob.glob(os.path.join(folder, pattern), recursive=recursive))
+    texts, names = [], []
+    for fp in files:
+        try:
+            with open(fp, "r", encoding=encoding_guess, errors="ignore") as f:
+                txt = f.read().strip()
+            if txt:
+                texts.append(txt)
+                names.append(fp)
+        except Exception as e:
+            print(f"[warn] Could not read {fp}: {e}")
+    return texts, names
+
+
+def batch(iterable: Iterable, n: int) -> Iterable[List]:
+    """Yield lists of size n from iterable."""
+    buf = []
+    for x in iterable:
+        buf.append(x)
+        if len(buf) == n:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+
+# ----------------------------
+# Core data structures
+# ----------------------------
 @dataclass
-class ScoredDoc:
-    doc_id: int
+class ScoredItem:
+    idx: int
     score: float
+
 
 class HybridRetriever:
     def __init__(
         self,
-        docs: List[str],
+        texts: List[str],
+        names: List[str],
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         bm25_k1: float = 1.5,
         bm25_b: float = 0.75,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        use_cosine: bool = True
+        use_cosine: bool = True,
+        embed_batch_size: int = 128,
+        show_progress: bool = True,
     ):
         """
-        docs: list of raw text documents
-        use_cosine: if True, uses cosine similarity for FAISS (IndexFlatIP on normalized vectors)
+        texts: chunk texts (each .txt file is one chunk)
+        names: filenames aligned with `texts`
         """
-        self.docs = docs
-        # --- BM25 index ---
-        self.tokens = [word_tokenize(d.lower()) for d in docs]
+        assert len(texts) == len(names) and len(texts) > 0, "texts and names must align and be non-empty"
+
+        self.texts = texts
+        self.names = names
+
+        # --- BM25 (sparse) ---
+        if show_progress:
+            print("Building BM25 index...")
+        self.tokens = [word_tokenize(t.lower()) for t in texts]
         self.bm25 = BM25Okapi(self.tokens, k1=bm25_k1, b=bm25_b)
 
-        # --- Dense model + FAISS index ---
+        # --- Dense (SentenceTransformer + FAISS) ---
+        if show_progress:
+            print(f"Loading embedding model: {model_name}")
         self.model = SentenceTransformer(model_name)
-        emb = self._embed(docs)  # shape: (N, D)
-        if use_cosine:
-            # normalize for cosine similarity with inner product
-            faiss.normalize_L2(emb)
-            self.index = faiss.IndexFlatIP(emb.shape[1])
-        else:
-            # L2 distance (convert back to similarity later)
-            self.index = faiss.IndexFlatL2(emb.shape[1])
 
-        self.index.add(emb)
+        if show_progress:
+            print("Embedding chunks (dense vectors)...")
+
+        embs = []
+        for mini in tqdm(batch(texts, embed_batch_size), disable=not show_progress, total=(len(texts) + embed_batch_size - 1)//embed_batch_size):
+            vecs = self.model.encode(mini, show_progress_bar=False, convert_to_numpy=True, batch_size=embed_batch_size, normalize_embeddings=False)
+            embs.append(vecs.astype("float32"))
+        embs = np.vstack(embs).astype("float32")
+
         self.use_cosine = use_cosine
-        self.emb_dim = emb.shape[1]
-
-    def _embed(self, texts: List[str]) -> np.ndarray:
-        vecs = self.model.encode(texts, batch_size=64, show_progress_bar=False)
-        return np.asarray(vecs, dtype="float32")
-
-    def _bm25_scores(self, query: str, k: int) -> List[ScoredDoc]:
-        q_tokens = word_tokenize(query.lower())
-        scores = self.bm25.get_scores(q_tokens)  # shape: (N,)
-        top_idx = np.argpartition(scores, -k)[-k:]
-        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
-        return [ScoredDoc(int(i), float(scores[i])) for i in top_idx]
-
-    def _faiss_scores(self, query: str, k: int) -> List[ScoredDoc]:
-        q = self._embed([query]).astype("float32")
-        if self.use_cosine:
-            faiss.normalize_L2(q)
-            sims, idxs = self.index.search(q, k)  # inner product ~ cosine
-            sims = sims[0]
+        if use_cosine:
+            # Normalize for cosine similarity (then use inner product)
+            faiss.normalize_L2(embs)
+            self.index = faiss.IndexFlatIP(embs.shape[1])
         else:
-            # Convert L2 distances to similarity by negating
-            dists, idxs = self.index.search(q, k)
-            sims = -dists[0]
-        idxs = idxs[0]
-        return [ScoredDoc(int(i), float(sims[j])) for j, i in enumerate(idxs)]
+            self.index = faiss.IndexFlatL2(embs.shape[1])
 
+        self.index.add(embs)
+        if show_progress:
+            print(f"Indexed {len(texts)} chunks.")
+
+    # ----------------------------
+    # Internal helpers
+    # ----------------------------
     @staticmethod
     def _minmax(scores: Dict[int, float]) -> Dict[int, float]:
         if not scores:
             return {}
-        vals = np.array(list(scores.values()), dtype="float32")
+        vals = np.fromiter(scores.values(), dtype="float32")
         vmin, vmax = float(vals.min()), float(vals.max())
         if vmax == vmin:
-            # avoid div by zero; map all to 1.0
             return {k: 1.0 for k in scores}
         return {k: (v - vmin) / (vmax - vmin) for k, v in scores.items()}
 
-    def _reciprocal_rank_fusion(
-        self,
-        lists: List[List[ScoredDoc]],
-        k: int,
-        rrf_k: float = 60.0
-    ) -> List[ScoredDoc]:
-        """Optional: robust fusion ignoring absolute score scales."""
-        ranks: Dict[int, float] = {}
-        for results in lists:
-            for rank, sd in enumerate(results):
-                ranks[sd.doc_id] = ranks.get(sd.doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
-        items = [ScoredDoc(doc_id, score) for doc_id, score in ranks.items()]
-        items.sort(key=lambda x: x.score, reverse=True)
-        return items[:k]
+    def _bm25_topk(self, query: str, k: int) -> List<ScoredItem]:
+        q_tokens = word_tokenize(query.lower())
+        scores = self.bm25.get_scores(q_tokens)
+        if k >= len(scores):
+            order = np.argsort(scores)[::-1]
+        else:
+            # partial sort then exact sort among top-k
+            cand = np.argpartition(scores, -k)[-k:]
+            order = cand[np.argsort(scores[cand])[::-1]]
+        return [ScoredItem(int(i), float(scores[i])) for i in order[:k]]
 
+    def _faiss_topk(self, query: str, k: int) -> List<ScoredItem]:
+        q = self.model.encode([query], convert_to_numpy=True).astype("float32")
+        if self.use_cosine:
+            faiss.normalize_L2(q)
+            sims, idxs = self.index.search(q, min(k, len(self.texts)))
+            sims, idxs = sims[0], idxs[0]
+            return [ScoredItem(int(i), float(sims[j])) for j, i in enumerate(idxs)]
+        else:
+            dists, idxs = self.index.search(q, min(k, len(self.texts)))
+            dists, idxs = dists[0], idxs[0]
+            sims = -dists  # convert L2 distance to similarity
+            return [ScoredItem(int(i), float(sims[j])) for j, i in enumerate(idxs)]
+
+    def _rrf(self, lists: List[List<ScoredItem]], k: int, rrf_k: float = 60.0) -> List<ScoredItem]:
+        scores: Dict[int, float] = {}
+        for lst in lists:
+            for rank, it in enumerate(lst):
+                scores[it.idx] = scores.get(it.idx, 0.0) + 1.0 / (rrf_k + rank + 1)
+        out = [ScoredItem(i, s) for i, s in scores.items()]
+        out.sort(key=lambda x: x.score, reverse=True)
+        return out[:k]
+
+    # ----------------------------
+    # Public search API
+    # ----------------------------
     def search(
         self,
         query: str,
-        k_bm25: int = 20,
-        k_faiss: int = 20,
+        k_bm25: int = 50,
+        k_faiss: int = 50,
         k_final: int = 10,
         alpha: float = 0.5,
-        use_rrf: bool = False
-    ) -> List[Tuple[int, float, str]]:
+        use_rrf: bool = False,
+    ) -> List[Tuple[str, float, str]]:
         """
-        alpha: weight for FAISS after min-max normalization.
-               final_score = alpha * dense + (1 - alpha) * sparse
-        use_rrf: if True, use Reciprocal Rank Fusion instead of weighted scores.
-        returns: list of (doc_id, score, doc_text)
+        Returns a ranked list of (filename, fused_score, text).
+
+        alpha: weight for FAISS after min-max normalization in [0,1]
+        use_rrf: if True, use Reciprocal Rank Fusion instead of weighted scores
         """
-        bm25 = self._bm25_scores(query, k_bm25)
-        faiss_ = self._faiss_scores(query, k_faiss)
+        bm25 = self._bm25_topk(query, k_bm25)
+        faiss_ = self._faiss_topk(query, k_faiss)
 
         if use_rrf:
-            fused = self._reciprocal_rank_fusion([bm25, faiss_], k=k_final)
-            return [(sd.doc_id, sd.score, self.docs[sd.doc_id]) for sd in fused]
+            fused = self._rrf([bm25, faiss_], k_final)
+            return [(self.names[it.idx], it.score, self.texts[it.idx]) for it in fused]
 
-        # Weighted fusion
-        sparse = {sd.doc_id: sd.score for sd in bm25}
-        dense = {sd.doc_id: sd.score for sd in faiss_}
-
-        # min-max normalize within each list to make scores comparable
+        # Weighted fusion with min-max normalization
+        sparse = {it.idx: it.score for it in bm25}
+        dense = {it.idx: it.score for it in faiss_}
         sparse_n = self._minmax(sparse)
         dense_n = self._minmax(dense)
-
-        # union of candidates
         all_ids = set(sparse_n) | set(dense_n)
-        fused: List[ScoredDoc] = []
+
+        fused = []
         for i in all_ids:
             s = sparse_n.get(i, 0.0)
             d = dense_n.get(i, 0.0)
-            fused.append(ScoredDoc(i, (1 - alpha) * s + alpha * d))
+            fused.append(ScoredItem(i, (1 - alpha) * s + alpha * d))
 
         fused.sort(key=lambda x: x.score, reverse=True)
         fused = fused[:k_final]
-        return [(sd.doc_id, sd.score, self.docs[sd.doc_id]) for sd in fused]
+        return [(self.names[it.idx], it.score, self.texts[it.idx]) for it in fused]
 
-# --- Example usage ---
+
+# ----------------------------
+# CLI usage
+# ----------------------------
 if __name__ == "__main__":
-    corpus = [
-        "FAISS is a library for efficient similarity search and clustering of dense vectors.",
-        "BM25 is a ranking function used by search engines to estimate the relevance of documents.",
-        "Retrieval-Augmented Generation (RAG) combines retrieval with generation to improve factuality.",
-        "You can combine BM25 with FAISS to build a hybrid search that captures keywords and semantics.",
-        "The cosine similarity between normalized vectors equals their inner product."
-    ]
+    import argparse
+    parser = argparse.ArgumentParser(description="Hybrid search over chunk .txt files (BM25 + FAISS).")
+    parser.add_argument("--folder", required=True, help="Path to folder containing .txt chunk files.")
+    parser.add_argument("--recursive", action="store_true", help="Search .txt files recursively.")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Weight for FAISS in [0,1].")
+    parser.add_argument("--k", type=int, default=5, help="Number of final results.")
+    parser.add_argument("--rrf", action="store_true", help="Use Reciprocal Rank Fusion instead of weighted.")
+    args = parser.parse_args()
 
-    retriever = HybridRetriever(corpus)
+    texts, names = read_txt_files(args.folder, recursive=args.recursive)
+    if not texts:
+        raise SystemExit("No .txt files found. Check the folder path or file extensions.")
 
-    q = "hybrid search with keywords and semantics"
-    results = retriever.search(q, k_bm25=3, k_faiss=3, k_final=5, alpha=0.6)
-    print("Hybrid results (weighted):")
-    for doc_id, score, text in results:
-        print(f"[{doc_id}] {score:.3f} :: {text}")
+    retriever = HybridRetriever(texts, names)
 
-    results_rrf = retriever.search(q, k_bm25=5, k_faiss=5, k_final=5, use_rrf=True)
-    print("\nHybrid results (RRF):")
-    for doc_id, score, text in results_rrf:
-        print(f"[{doc_id}] {score:.3f} :: {text}")
+    print("\nHybrid search ready. Type your query (or blank to exit):")
+    while True:
+        try:
+            q = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not q:
+            break
+
+        results = retriever.search(q, k_final=args.k, alpha=args.alpha, use_rrf=args.rrf)
+
+        print("\nTop results:")
+        for i, (fname, score, text) in enumerate(results, 1):
+            preview = text.replace("\n", " ")[:160]
+            if len(text) > 160:
+                preview += "..."
+            print(f"{i:>2}. {fname} | score={score:.4f}")
+            print(f"    {preview}")
+        print()
