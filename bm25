@@ -1,0 +1,169 @@
+# hybrid_retrieval.py
+import numpy as np
+from typing import List, Tuple, Dict
+from dataclasses import dataclass
+
+# --- BM25 (sparse) ---
+from rank_bm25 import BM25Okapi
+
+# --- Dense embeddings ---
+import faiss
+from sentence_transformers import SentenceTransformer
+
+# --- Simple tokenizer (swap for spaCy or custom if you like) ---
+import nltk
+nltk.download('punkt', quiet=True)
+from nltk.tokenize import word_tokenize
+
+@dataclass
+class ScoredDoc:
+    doc_id: int
+    score: float
+
+class HybridRetriever:
+    def __init__(
+        self,
+        docs: List[str],
+        bm25_k1: float = 1.5,
+        bm25_b: float = 0.75,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        use_cosine: bool = True
+    ):
+        """
+        docs: list of raw text documents
+        use_cosine: if True, uses cosine similarity for FAISS (IndexFlatIP on normalized vectors)
+        """
+        self.docs = docs
+        # --- BM25 index ---
+        self.tokens = [word_tokenize(d.lower()) for d in docs]
+        self.bm25 = BM25Okapi(self.tokens, k1=bm25_k1, b=bm25_b)
+
+        # --- Dense model + FAISS index ---
+        self.model = SentenceTransformer(model_name)
+        emb = self._embed(docs)  # shape: (N, D)
+        if use_cosine:
+            # normalize for cosine similarity with inner product
+            faiss.normalize_L2(emb)
+            self.index = faiss.IndexFlatIP(emb.shape[1])
+        else:
+            # L2 distance (convert back to similarity later)
+            self.index = faiss.IndexFlatL2(emb.shape[1])
+
+        self.index.add(emb)
+        self.use_cosine = use_cosine
+        self.emb_dim = emb.shape[1]
+
+    def _embed(self, texts: List[str]) -> np.ndarray:
+        vecs = self.model.encode(texts, batch_size=64, show_progress_bar=False)
+        return np.asarray(vecs, dtype="float32")
+
+    def _bm25_scores(self, query: str, k: int) -> List[ScoredDoc]:
+        q_tokens = word_tokenize(query.lower())
+        scores = self.bm25.get_scores(q_tokens)  # shape: (N,)
+        top_idx = np.argpartition(scores, -k)[-k:]
+        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+        return [ScoredDoc(int(i), float(scores[i])) for i in top_idx]
+
+    def _faiss_scores(self, query: str, k: int) -> List[ScoredDoc]:
+        q = self._embed([query]).astype("float32")
+        if self.use_cosine:
+            faiss.normalize_L2(q)
+            sims, idxs = self.index.search(q, k)  # inner product ~ cosine
+            sims = sims[0]
+        else:
+            # Convert L2 distances to similarity by negating
+            dists, idxs = self.index.search(q, k)
+            sims = -dists[0]
+        idxs = idxs[0]
+        return [ScoredDoc(int(i), float(sims[j])) for j, i in enumerate(idxs)]
+
+    @staticmethod
+    def _minmax(scores: Dict[int, float]) -> Dict[int, float]:
+        if not scores:
+            return {}
+        vals = np.array(list(scores.values()), dtype="float32")
+        vmin, vmax = float(vals.min()), float(vals.max())
+        if vmax == vmin:
+            # avoid div by zero; map all to 1.0
+            return {k: 1.0 for k in scores}
+        return {k: (v - vmin) / (vmax - vmin) for k, v in scores.items()}
+
+    def _reciprocal_rank_fusion(
+        self,
+        lists: List[List[ScoredDoc]],
+        k: int,
+        rrf_k: float = 60.0
+    ) -> List[ScoredDoc]:
+        """Optional: robust fusion ignoring absolute score scales."""
+        ranks: Dict[int, float] = {}
+        for results in lists:
+            for rank, sd in enumerate(results):
+                ranks[sd.doc_id] = ranks.get(sd.doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+        items = [ScoredDoc(doc_id, score) for doc_id, score in ranks.items()]
+        items.sort(key=lambda x: x.score, reverse=True)
+        return items[:k]
+
+    def search(
+        self,
+        query: str,
+        k_bm25: int = 20,
+        k_faiss: int = 20,
+        k_final: int = 10,
+        alpha: float = 0.5,
+        use_rrf: bool = False
+    ) -> List[Tuple[int, float, str]]:
+        """
+        alpha: weight for FAISS after min-max normalization.
+               final_score = alpha * dense + (1 - alpha) * sparse
+        use_rrf: if True, use Reciprocal Rank Fusion instead of weighted scores.
+        returns: list of (doc_id, score, doc_text)
+        """
+        bm25 = self._bm25_scores(query, k_bm25)
+        faiss_ = self._faiss_scores(query, k_faiss)
+
+        if use_rrf:
+            fused = self._reciprocal_rank_fusion([bm25, faiss_], k=k_final)
+            return [(sd.doc_id, sd.score, self.docs[sd.doc_id]) for sd in fused]
+
+        # Weighted fusion
+        sparse = {sd.doc_id: sd.score for sd in bm25}
+        dense = {sd.doc_id: sd.score for sd in faiss_}
+
+        # min-max normalize within each list to make scores comparable
+        sparse_n = self._minmax(sparse)
+        dense_n = self._minmax(dense)
+
+        # union of candidates
+        all_ids = set(sparse_n) | set(dense_n)
+        fused: List[ScoredDoc] = []
+        for i in all_ids:
+            s = sparse_n.get(i, 0.0)
+            d = dense_n.get(i, 0.0)
+            fused.append(ScoredDoc(i, (1 - alpha) * s + alpha * d))
+
+        fused.sort(key=lambda x: x.score, reverse=True)
+        fused = fused[:k_final]
+        return [(sd.doc_id, sd.score, self.docs[sd.doc_id]) for sd in fused]
+
+# --- Example usage ---
+if __name__ == "__main__":
+    corpus = [
+        "FAISS is a library for efficient similarity search and clustering of dense vectors.",
+        "BM25 is a ranking function used by search engines to estimate the relevance of documents.",
+        "Retrieval-Augmented Generation (RAG) combines retrieval with generation to improve factuality.",
+        "You can combine BM25 with FAISS to build a hybrid search that captures keywords and semantics.",
+        "The cosine similarity between normalized vectors equals their inner product."
+    ]
+
+    retriever = HybridRetriever(corpus)
+
+    q = "hybrid search with keywords and semantics"
+    results = retriever.search(q, k_bm25=3, k_faiss=3, k_final=5, alpha=0.6)
+    print("Hybrid results (weighted):")
+    for doc_id, score, text in results:
+        print(f"[{doc_id}] {score:.3f} :: {text}")
+
+    results_rrf = retriever.search(q, k_bm25=5, k_faiss=5, k_final=5, use_rrf=True)
+    print("\nHybrid results (RRF):")
+    for doc_id, score, text in results_rrf:
+        print(f"[{doc_id}] {score:.3f} :: {text}")
