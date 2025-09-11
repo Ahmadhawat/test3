@@ -1,0 +1,152 @@
+Got it — you already write each leg (BM25 + vector) to its own JSON. To get a hybrid search with RRF, just fuse those two JSONs by rank.
+
+Here’s a tiny drop-in step that:
+
+reads your two result JSON files,
+
+aligns items by chunkname (robust if doc_ids differ),
+
+computes RRF: score = Σ w_i * 1/(K + rank_i),
+
+writes a new hybrid_results.json.
+
+
+You can paste this anywhere in your pipeline (e.g., src/steps/hybrid_search_impls/RRFHybridFuseV1.py) and call it after both searches.
+
+from __future__ import annotations
+from pathlib import Path
+import json
+from typing import Dict, List
+
+class RRFHybridFuseV1:
+    """
+    Fuse BM25 + Vector search results using Reciprocal Rank Fusion (RRF).
+
+    Expects JSON files shaped like:
+      { "query": "...", "results": [
+          { "doc_id": 123, "chunkname": "...", "filename_txt": "...",
+            "file_path_html": "...", "scores": {"vector": 0.42} }
+        ]}
+
+    Config keys used:
+      paths.vector_results_path
+      paths.bm25_results_path
+      paths.hybrid_results_path   (output)
+      rrf.K                       (default 60)
+      rrf.weights.vector          (default 1.0)
+      rrf.weights.bm25            (default 1.0)
+      query.k                     (final top-k to emit)
+    """
+    name = "rrfHybridFuseV1"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def _load(self, p: Path) -> List[dict]:
+        if not p.exists():
+            return []
+        j = json.loads(p.read_text(encoding="utf-8"))
+        return j.get("results", [])
+
+    @staticmethod
+    def _ranks(items: List[dict], score_key: str) -> Dict[str, int]:
+        # Sort descending by that leg’s score; rank starts at 1
+        # Key by chunkname to avoid id mismatches.
+        sorted_items = sorted(
+            (x for x in items if score_key in x.get("scores", {})),
+            key=lambda x: x["scores"][score_key],
+            reverse=True,
+        )
+        return {x["chunkname"]: i + 1 for i, x in enumerate(sorted_items)}
+
+    def run(self):
+        pvec = Path(self.cfg["paths"]["vector_results_path"])
+        pbm25 = Path(self.cfg["paths"]["bm25_results_path"])
+        pout = Path(self.cfg["paths"].get("hybrid_results_path", "./Daten/workspace/vector_results.json"))
+
+        K = int(self.cfg.get("rrf", {}).get("K", 60))
+        wvec = float(self.cfg.get("rrf", {}).get("weights", {}).get("vector", 1.0))
+        wbm = float(self.cfg.get("rrf", {}).get("weights", {}).get("bm25", 1.0))
+        topk = int(self.cfg.get("query", {}).get("k", 10))
+
+        vec = self._load(pvec)
+        bm  = self._load(pbm25)
+
+        r_vec = self._ranks(vec, "vector")
+        r_bm  = self._ranks(bm,  "bm25")
+
+        # union of keys
+        keys = set(r_vec) | set(r_bm)
+
+        def rrf_score(kname: str) -> float:
+            s = 0.0
+            if kname in r_vec:
+                s += wvec * 1.0 / (K + r_vec[kname])
+            if kname in r_bm:
+                s += wbm * 1.0 / (K + r_bm[kname])
+            return s
+
+        # pick representative metadata from either leg
+        meta: Dict[str, dict] = {}
+        for item in vec + bm:
+            meta.setdefault(item["chunkname"], item)
+
+        fused = []
+        for kname in keys:
+            m = meta[kname]
+            fused.append({
+                "doc_id": m.get("doc_id"),
+                "chunkname": kname,
+                "filename_txt": m.get("filename_txt", ""),
+                "file_path_html": m.get("file_path_html", ""),
+                "scores": {
+                    "rrf": rrf_score(kname),
+                    "vector_rank": r_vec.get(kname),
+                    "bm25_rank": r_bm.get(kname),
+                },
+            })
+
+        fused.sort(key=lambda x: x["scores"]["rrf"], reverse=True)
+        out = {
+            "query": self.cfg.get("query", {}).get("text", ""),
+            "results": fused[:topk]
+        }
+        pout.parent.mkdir(parents=True, exist_ok=True)
+        pout.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"RRF hybrid written to {pout}")
+
+Minimal YAML additions
+
+paths:
+  # already in your file:
+  vector_results_path: ./Daten/workspace/vector_results.json
+  bm25_results_path:   ./Daten/workspace/bm25_results.json
+  hybrid_results_path: ./Daten/workspace/hybrid_results.json   # <— output
+
+rrf:
+  K: 60                 # typical 60; smaller = stronger top-rank emphasis
+  weights:
+    vector: 1.0
+    bm25: 1.0
+
+query:
+  k: 10                 # final top-K after fusion
+
+Usage flow
+
+1. Run your vector step → writes vector_results.json.
+
+
+2. Run your bm25 step → writes bm25_results.json.
+
+
+3. Run RRFHybridFuseV1 → writes hybrid_results.json with fused ranking.
+
+
+
+> Tip: If the two legs use different identifiers, key on chunkname (as above). If you prefer doc_id, ensure both JSONs assign the same doc_id to the same chunk and change the _ranks function’s key accordingly.
+
+
+
+That’s it — you now have a clean RRF hybrid built straight from your two JSON files.
+
