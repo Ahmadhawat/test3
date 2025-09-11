@@ -1,0 +1,238 @@
+# build_whoosh_index.py
+import os
+import glob
+import json
+from whoosh import index
+from whoosh.fields import Schema, ID, TEXT
+from whoosh.analysis import KeywordAnalyzer, SimpleAnalyzer, StemmingAnalyzer
+
+
+def build_index(txt_folder: str, out_dir: str, analyzer_type: str = "keyword"):
+    """
+    Build a Whoosh index from .txt files with a specified analyzer.
+
+    analyzer_type:
+      - "keyword" : preserves whole words (best for German compounds like Querprofillinien)
+      - "simple"  : lowercases + tokenizes, no stemming
+      - "stemmed" : default stemmed analyzer (may cut compounds)
+    """
+
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    # Pick analyzer
+    if analyzer_type == "keyword":
+        analyzer = KeywordAnalyzer(lowercase=True, commas=False)
+    elif analyzer_type == "simple":
+        analyzer = SimpleAnalyzer()
+    else:
+        analyzer_type = "stemmed"
+        analyzer = StemmingAnalyzer()
+
+    schema = Schema(
+        doc_id=ID(stored=True, unique=True),
+        chunkname=ID(stored=True),
+        text=TEXT(stored=True, analyzer=analyzer)
+    )
+
+    # Create index
+    if index.exists_in(out_dir):
+        ix = index.open_dir(out_dir)
+        ix.close()
+        for f in os.listdir(out_dir):
+            os.remove(os.path.join(out_dir, f))
+    ix = index.create_in(out_dir, schema)
+
+    writer = ix.writer()
+
+    files = sorted(glob.glob(os.path.join(txt_folder, "*.txt")))
+    for i, file in enumerate(files):
+        try:
+            with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().strip()
+        except Exception as e:
+            print(f"[warn] Could not read {file}: {e}")
+            continue
+        if not content:
+            continue
+        writer.add_document(
+            doc_id=str(i),
+            chunkname=os.path.basename(file),
+            text=content
+        )
+
+    writer.commit()
+
+    # Write analyzer.json for HybridSearchV1
+    meta_file = os.path.join(out_dir, "analyzer.json")
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump({"analyzer": analyzer_type}, f, indent=2, ensure_ascii=False)
+
+    print(f"✅ Built Whoosh index with {len(files)} documents at {out_dir}")
+    print(f"   Analyzer type: {analyzer_type}")
+    print(f"   Metadata written to {meta_file}")
+
+
+if __name__ == "__main__":
+    # Example usage: build a keyword-preserving index
+    build_index(
+        txt_folder="./data/chunks",           # folder with your .txt chunk files
+        out_dir="./data/lexical_index_kw",    # where to save the index
+        analyzer_type="keyword"               # "keyword" | "simple" | "stemmed"
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Great 👍 — let’s write a new index builder that will:
+
+1. Build a Whoosh index with the chosen analyzer (KeywordAnalyzer, SimpleAnalyzer, or StemmingAnalyzer).
+
+
+2. Automatically create an analyzer.json file in the index directory so HybridSearchV1 can detect it later.
+
+
+
+
+---
+
+📄 File: build_whoosh_index.py
+
+# build_whoosh_index.py
+import os
+import glob
+import json
+from whoosh import index
+from whoosh.fields import Schema, ID, TEXT
+from whoosh.analysis import KeywordAnalyzer, SimpleAnalyzer, StemmingAnalyzer
+
+
+def build_index(txt_folder: str, out_dir: str, analyzer_type: str = "keyword"):
+    """
+    Build a Whoosh index from .txt files with a specified analyzer.
+
+    analyzer_type:
+      - "keyword" : preserves whole words (best for German compounds like Querprofillinien)
+      - "simple"  : lowercases + tokenizes, no stemming
+      - "stemmed" : default stemmed analyzer (may cut compounds)
+    """
+
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    # Pick analyzer
+    if analyzer_type == "keyword":
+        analyzer = KeywordAnalyzer(lowercase=True, commas=False)
+    elif analyzer_type == "simple":
+        analyzer = SimpleAnalyzer()
+    else:
+        analyzer_type = "stemmed"
+        analyzer = StemmingAnalyzer()
+
+    schema = Schema(
+        doc_id=ID(stored=True, unique=True),
+        chunkname=ID(stored=True),
+        text=TEXT(stored=True, analyzer=analyzer)
+    )
+
+    # Create index
+    if index.exists_in(out_dir):
+        ix = index.open_dir(out_dir)
+        ix.close()
+        for f in os.listdir(out_dir):
+            os.remove(os.path.join(out_dir, f))
+    ix = index.create_in(out_dir, schema)
+
+    writer = ix.writer()
+
+    files = sorted(glob.glob(os.path.join(txt_folder, "*.txt")))
+    for i, file in enumerate(files):
+        try:
+            with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().strip()
+        except Exception as e:
+            print(f"[warn] Could not read {file}: {e}")
+            continue
+        if not content:
+            continue
+        writer.add_document(
+            doc_id=str(i),
+            chunkname=os.path.basename(file),
+            text=content
+        )
+
+    writer.commit()
+
+    # Write analyzer.json for HybridSearchV1
+    meta_file = os.path.join(out_dir, "analyzer.json")
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump({"analyzer": analyzer_type}, f, indent=2, ensure_ascii=False)
+
+    print(f"✅ Built Whoosh index with {len(files)} documents at {out_dir}")
+    print(f"   Analyzer type: {analyzer_type}")
+    print(f"   Metadata written to {meta_file}")
+
+
+if __name__ == "__main__":
+    # Example usage: build a keyword-preserving index
+    build_index(
+        txt_folder="./data/chunks",           # folder with your .txt chunk files
+        out_dir="./data/lexical_index_kw",    # where to save the index
+        analyzer_type="keyword"               # "keyword" | "simple" | "stemmed"
+    )
+
+
+---
+
+✅ Usage
+
+Build a keyword-preserving index (best for German compounds):
+
+python build_whoosh_index.py
+
+or explicitly:
+
+build_index("./data/chunks", "./data/lexical_index_kw", analyzer_type="keyword")
+
+Build a simple (no stemming, just lowercase + tokenize) index:
+
+build_index("./data/chunks", "./data/lexical_index_simple", analyzer_type="simple")
+
+Build a stemmed index (default Whoosh behavior):
+
+build_index("./data/chunks", "./data/lexical_index_stemmed", analyzer_type="stemmed")
+
+
+---
+
+🔗 Integration with HybridSearchV1
+
+HybridSearchV1 will check analyzer.json inside the index folder.
+
+If "analyzer": "keyword", your queries like Querprofillinien will be treated as whole words.
+
+If "stemmed" or "simple", it will adjust query parsing accordingly.
+
+
+
+---
+
+👉 Do you want me to also add an option in HybridSearchV1 to boost exact matches (from a keyword field) but still consider fuzzy matches (from a stemmed field)? That would give you the best of both worlds.
+
