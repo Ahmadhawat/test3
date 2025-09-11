@@ -1,0 +1,227 @@
+# src/steps/vector_search_impls/CVectorSearchV1.py
+
+from pathlib import Path
+import json
+from typing import Dict, List
+import os
+import re
+
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+# Project-local utilities
+# If you have a base ABS for vector steps, import it here.
+# Otherwise, you can temporarily reuse the hybridSearch ABS or switch to a simple object.
+# from src.steps.vector_search_impls.CVectorSearchABS import vectorSearch
+from src.steps.hybrid_search_impls.CHybridSearchABS import hybridSearch  # reuse base to minimize wiring
+from src.pipeline.Context import Context
+from src.utils.logging import get_logger
+
+
+# -----------------------------
+# helpers
+# -----------------------------
+
+def _normalize2(v: np.ndarray) -> np.ndarray:
+    v = v.astype("float32")
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    n = np.maximum(n, 1e-12)
+    return v / n
+
+
+def _is_ivf(idx) -> bool:
+    return isinstance(
+        idx,
+        (faiss.IndexIVFFlat, faiss.IndexIVFPQ, faiss.IndexIVFScalarQuantizer),
+    )
+
+
+# convert "content\strasse\profran_0001_chunk0004.txt" -> "content/strasse/profran_00001.htm"
+_CHUNK_SUFFIX_RE = re.compile(r"_chunk\d{4}\.txt$", re.IGNORECASE)
+
+
+def chunk_to_real_path(chunk_filename: str, source_html_root: str | None = None) -> str:
+    """
+    Map a chunk filename (as stored in vector_metadata.json) to the original .htm file.
+    Rules:
+      - drop trailing '_chunkNNNN.txt'
+      - change extension to '.htm'
+      - optionally prefix with source_html_root
+      - normalize slashes and make OS-specific
+    """
+    rel = chunk_filename
+    rel = _CHUNK_SUFFIX_RE.sub(".htm", rel)
+    rel = rel.replace("\\", "/").replace("/", os.sep)
+    return os.path.join(source_html_root, rel) if source_html_root else rel
+
+
+def chunk_to_real_txt(chunk_filename: str, source_txt_root: str | None = None) -> str:
+    """
+    Map a chunk filename (as stored in vector_metadata.json) to the original .txt file.
+    Rules:
+      - drop trailing '_chunkNNNN.txt' -> '.txt'
+      - optionally prefix with source_txt_root
+      - normalize separators
+    """
+    rel = chunk_filename
+    rel = _CHUNK_SUFFIX_RE.sub(".txt", rel)
+    rel = rel.replace("\\", "/").replace("/", os.sep)
+    return os.path.join(source_txt_root, rel) if source_txt_root else rel
+
+
+def _norm_path(s: str) -> str:
+    return s.replace("\\", "/")
+
+
+def _is_int_str(s) -> bool:
+    return isinstance(s, str) and s.isdigit()
+
+
+# -----------------------------
+# main class
+# -----------------------------
+
+class VectorSearchV1(hybridSearch):  # swap to your own base if you have one
+    """
+    Vector-only search step.
+
+    - Reads FAISS index + vector_metadata.json from cfg.paths.vector_dataset_dir
+    - Embeds query using SentenceTransformer from cfg.embedding.{model_name, cache_folder}
+    - Optional ES-style query prefix controlled by cfg.es_prefixes.use and cfg.es_prefixes.query_prefix
+    - Searches top-k (cfg.query.k or default 10) with FAISS only
+    - Writes results (vector-only scores) to cfg.paths.vector_results_path
+      (default: ./data/workspace/vector_results.json)
+    - Stores ctx.artifacts['vector_results_path']
+    """
+    name = "vectorSearchV1"
+
+    def run(self, ctx: Context) -> None:
+        log = get_logger(self.name)
+
+        # -------- Paths & config --------
+        vroot = Path(ctx.cfg["paths"]["vector_dataset_dir"])
+
+        index_path = vroot / "vector_index.faiss"
+        meta_path = vroot / "vector_metadata.json"
+
+        if not index_path.exists() or not meta_path.exists():
+            log.error("Missing FAISS index or metadata in %s", vroot)
+            return
+
+        qcfg = ctx.cfg.get("query", {}) or {}
+        k = int(qcfg.get("k", 10))
+
+        # Query text
+        qtext = ctx.artifacts.get("corrected_query") or qcfg.get("text")
+        if not qtext:
+            log.error("No query text provided. Set artifacts['corrected_query'] or cfg.query.text")
+            return
+
+        # -------- Embedder (local) --------
+        ecfg = ctx.cfg.get("embedding", {}) or {}
+        model_name = ecfg.get("model_name", "")
+        cache_folder = ecfg.get("cache_folder", "./data/models/st")
+        try:
+            model = SentenceTransformer(model_name, cache_folder=cache_folder)
+        except Exception as e:
+            log.error("Failed to load SentenceTransformer '%s': %s", model_name, e)
+            return
+
+        # Optional query prefix (for models trained with prefixes)
+        esp = ctx.cfg.get("es_prefixes", {}) or {}
+        use_es = bool(esp.get("use", False))
+        qprefix = esp.get("query_prefix", "query: ")
+
+        # -------- Load metadata & build id->name map --------
+        try:
+            raw_meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+        except Exception as e:
+            log.error("Failed to read metadata from %s: %s", meta_path, e)
+            return
+
+        id2name_raw = raw_meta.get("id_to_filename", raw_meta)
+        if not isinstance(id2name_raw, dict):
+            log.error("vector_metadata.json has unexpected structure.")
+            return
+
+        id2name: Dict[str, str] = {
+            k: v for k, v in id2name_raw.items() if _is_int_str(k) and isinstance(v, str)
+        }
+
+        def meta_get(did: int) -> str:
+            return id2name.get(str(did), "")
+
+        # -------- FAISS search --------
+        try:
+            index = faiss.read_index(str(index_path))
+        except Exception as e:
+            log.error("Failed to read FAISS index at %s: %s", index_path, e)
+            return
+
+        # IVF tuning if applicable
+        if _is_ivf(index):
+            nprobe = int(ctx.cfg.get("faiss", {}).get("nprobe", 32))
+            try:
+                faiss.ParameterSpace().set_index_parameter(index, "nprobe", nprobe)
+            except Exception:
+                try:
+                    index.nprobe = nprobe  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+        # Encode query
+        q_in = f"{qprefix}{qtext}" if use_es else qtext
+        try:
+            qv = model.encode([q_in], show_progress_bar=False)
+        except Exception as e:
+            log.error("Embedding failed: %s", e)
+            return
+        qv = _normalize2(np.asarray(qv, dtype="float32"))
+
+        # Search
+        D, I = index.search(qv, k)
+        vec_scores: Dict[int, float] = {}
+        for doc_id, score in zip(I[0].tolist(), D[0].tolist()):
+            if int(doc_id) < 0:
+                continue
+            vec_scores[int(doc_id)] = float(score)
+
+        # -------- Attach metadata & write JSON --------
+        results: List[Dict] = []
+
+        source_html_root = ctx.cfg["paths"].get("source_html_root", "")
+        source_txt_root = ctx.cfg["paths"].get("source_txt_root", "")
+
+        for did, score in sorted(vec_scores.items(), key=lambda x: x[1], reverse=True):
+            fname = meta_get(did)
+            if not fname:
+                continue
+            file_html = chunk_to_real_path(fname, source_html_root or None)
+            file_txt = chunk_to_real_txt(fname, source_txt_root or None)
+
+            results.append(
+                {
+                    "doc_id": int(did),
+                    "chunkname": fname,
+                    "filename_txt": str(Path(file_txt).name) if file_txt else "",
+                    "file_path_html": file_html,
+                    "scores": {
+                        "vector": float(score)
+                    },
+                }
+            )
+
+        out_path = Path(ctx.cfg["paths"].get("vector_results_path", "./data/workspace/vector_results.json"))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            out_path.write_text(
+                json.dumps({"query": qtext, "results": results}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log.error("Failed to write vector results to %s: %s", out_path, e)
+            return
+
+        log.info("Vector-only top %d written to %s", len(results), out_path)
+        ctx.artifacts["vector_results_path"] = str(out_path)
