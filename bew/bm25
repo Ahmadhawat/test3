@@ -1,0 +1,250 @@
+Absolutely 👍 — let’s put it all together. Below is a complete BM25 search step that works directly on your folder of .txt chunks, and implements:
+
+Length-weighted query terms (longer German words contribute more).
+
+Optional exact substring bonus (so a chunk containing “querprofillinien” scores higher than one with only “querprofil”).
+
+Caching of tokenized documents for speed.
+
+JSON output in the same structure you already use.
+
+
+
+---
+
+src/steps/bm25_search_impls/CBM25FolderSearchV1.py
+
+from __future__ import annotations
+from pathlib import Path
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+import json, math, re, os
+from typing import Dict, List, Sequence
+
+from src.steps.hybrid_search_impls.CHybridSearchABS import hybridSearch
+from src.pipeline.Context import Context
+from src.utils.logging import get_logger
+
+# ---------------- Tokenizer ----------------
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+def simple_tokenize(text: str) -> List[str]:
+    return [t.lower() for t in _TOKEN_RE.findall(text)]
+
+# ---------------- BM25 Core ----------------
+@dataclass
+class BM25Index:
+    N: int
+    doc_len: List[int]
+    avgdl: float
+    df: Dict[str, int]
+    tfs: List[Dict[str, int]]
+    k1: float = 1.2
+    b: float = 0.75
+
+    def idf(self, term: str) -> float:
+        n = self.df.get(term, 0)
+        if n == 0:
+            return 0.0
+        return math.log((self.N - n + 0.5) / (n + 0.5) + 1e-12)
+
+    def score(
+        self,
+        q_tokens: Sequence[str],
+        doc_id: int,
+        q_weights: Dict[str, float] | None = None
+    ) -> float:
+        tf = self.tfs[doc_id]
+        dl = self.doc_len[doc_id]
+        s = 0.0
+        for term in q_tokens:
+            f = tf.get(term, 0)
+            if f == 0:
+                continue
+            w = 1.0 if not q_weights else q_weights.get(term, 1.0)
+            idf = self.idf(term)
+            denom = f + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+            s += w * idf * (f * (self.k1 + 1)) / (denom + 1e-12)
+        return s
+
+
+def build_bm25_index(docs_tokens: List[List[str]], k1=1.2, b=0.75) -> BM25Index:
+    N = len(docs_tokens)
+    tfs: List[Dict[str, int]] = []
+    df: Dict[str, int] = defaultdict(int)
+    doc_len: List[int] = []
+    for toks in docs_tokens:
+        c = Counter(toks)
+        tfs.append(c)
+        doc_len.append(len(toks))
+        for term in c:
+            df[term] += 1
+    avgdl = (sum(doc_len) / N) if N else 0.0
+    return BM25Index(N=N, doc_len=doc_len, avgdl=avgdl, df=dict(df), tfs=tfs, k1=k1, b=b)
+
+# ---------------- Search Step ----------------
+class BM25FolderSearchV1(hybridSearch):
+    """
+    BM25 search over a folder of .txt chunks.
+
+    Config:
+      paths.chunks_dir          -> folder with *.txt chunks
+      paths.bm25_results_path   -> JSON output
+      bm25.k1, bm25.b           -> BM25 params
+      bm25.length_weight_alpha  -> weight longer query tokens more (default 1.0)
+      bm25.exact_substring_boost-> extra bonus if a long query token appears exactly
+      bm25.min_exact_len        -> only apply boost to tokens >= this length
+    """
+
+    name = "bm25FolderSearchV1"
+
+    def run(self, ctx: Context) -> None:
+        log = get_logger(self.name)
+
+        # ---- Paths & config ----
+        pcfg = ctx.cfg.get("paths", {}) or {}
+        chunks_dir = Path(pcfg.get("chunks_dir", "./data/workspace/chunking_files"))
+        out_path = Path(pcfg.get("bm25_results_path", "./data/workspace/bm25_results.json"))
+
+        if not chunks_dir.exists():
+            log.error("chunks_dir not found: %s", chunks_dir)
+            return
+
+        qcfg = ctx.cfg.get("query", {}) or {}
+        k = int(qcfg.get("k", 10))
+        qtext = ctx.artifacts.get("corrected_query") or qcfg.get("text")
+        if not qtext:
+            log.error("No query text provided.")
+            return
+        q_tokens = simple_tokenize(qtext)
+
+        bcfg = ctx.cfg.get("bm25", {}) or {}
+        k1 = float(bcfg.get("k1", 1.2))
+        b = float(bcfg.get("b", 0.75))
+        cache_path = Path(bcfg.get("cache_path", "./data/workspace/bm25_tokens_cache.json"))
+        alpha = float(bcfg.get("length_weight_alpha", 1.0))
+        exact_boost = float(bcfg.get("exact_substring_boost", 0.0))
+        min_exact_len = int(bcfg.get("min_exact_len", 10))
+
+        # ---- Files ----
+        files = sorted([p for p in chunks_dir.rglob("*.txt") if p.is_file()])
+
+        # ---- Try cache ----
+        docs_tokens: List[List[str]] = []
+        raw_texts: List[str] = []
+        cache_ok = False
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                if cached.get("chunks_dir") == str(chunks_dir) and cached.get("files") == [str(f) for f in files]:
+                    docs_tokens = cached["docs_tokens"]
+                    raw_texts = cached.get("raw_texts", [""] * len(files))
+                    cache_ok = True
+            except Exception:
+                cache_ok = False
+
+        # ---- Build tokens if no cache ----
+        if not cache_ok:
+            docs_tokens, raw_texts = [], []
+            for f in files:
+                try:
+                    txt = f.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    txt = ""
+                raw_texts.append(txt)
+                docs_tokens.append(simple_tokenize(txt))
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(
+                    json.dumps(
+                        {
+                            "chunks_dir": str(chunks_dir),
+                            "files": [str(f) for f in files],
+                            "docs_tokens": docs_tokens,
+                            "raw_texts": raw_texts,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                log.warning("Failed to write BM25 token cache: %s", e)
+
+        # ---- Build index ----
+        bm25 = build_bm25_index(docs_tokens, k1=k1, b=b)
+
+        # ---- Query term weights ----
+        maxlen = max((len(t) for t in q_tokens), default=1)
+        q_weights = {t: (len(t) / maxlen) ** alpha for t in q_tokens}
+
+        # ---- Score docs ----
+        scores = []
+        for i, f in enumerate(files):
+            base = bm25.score(q_tokens, i, q_weights=q_weights)
+            bonus = 0.0
+            if exact_boost > 0:
+                text_lc = raw_texts[i].lower()
+                for t in q_tokens:
+                    if len(t) >= min_exact_len and t in text_lc:
+                        bonus += exact_boost * (len(t) / maxlen)
+            scores.append((i, float(base + bonus)))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        top = scores[:k]
+
+        # ---- Results JSON ----
+        results = []
+        for pos, s in top:
+            f = files[pos]
+            results.append({
+                "doc_id": pos,
+                "chunkname": str(f.relative_to(chunks_dir)),
+                "filename_txt": f.name,
+                "file_path_html": "",  # optional
+                "scores": {"bm25": s},
+            })
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps({"query": qtext, "results": results}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log.info("BM25 top %d written to %s", len(results), out_path)
+        ctx.artifacts["bm25_results_path"] = str(out_path)
+
+
+---
+
+Example config (config.search.yaml)
+
+paths:
+  chunks_dir: ./Daten/workspace/chunking_files
+  bm25_results_path: ./Daten/workspace/bm25_results.json
+
+query:
+  text: "Querprofillinien bis zu einer bestimmten Station plotten"
+  k: 10
+
+bm25:
+  k1: 1.2
+  b: 0.75
+  cache_path: ./Daten/workspace/bm25_tokens_cache.json
+  length_weight_alpha: 2.0          # longer words weigh more
+  exact_substring_boost: 2.0        # strong boost for exact match
+  min_exact_len: 10                 # only boost long words
+
+
+---
+
+✅ With this code:
+
+A chunk containing “querprofillinien” will outrank one with only “querprofil”, because:
+
+length-based weighting makes querprofillinien a heavier query term,
+
+exact-substring bonus adds extra score if the chunk has the full word.
+
+
+
+Do you want me to also show you how to fuse these BM25 results with your FAISS vector results into a single hybrid ranking?
+
