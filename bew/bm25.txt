@@ -1,0 +1,238 @@
+Perfect—since your chunks already live in a single folder, you don’t need vector_metadata.json. Here’s a drop-in BM25 step that:
+
+scans a folder of .txt chunks,
+
+scores them with Okapi BM25,
+
+returns the top-k (e.g., 10),
+
+and writes a JSON that matches your vector step’s shape.
+
+
+
+---
+
+1) BM25 from a folder of chunks
+
+Create src/steps/bm25_search_impls/CBM25FolderSearchV1.py:
+
+# src/steps/bm25_search_impls/CBM25FolderSearchV1.py
+from __future__ import annotations
+from pathlib import Path
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+import json, math, re, os
+from typing import Dict, List, Sequence
+
+from src.steps.hybrid_search_impls.CHybridSearchABS import hybridSearch
+from src.pipeline.Context import Context
+from src.utils.logging import get_logger
+
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+def simple_tokenize(text: str) -> List[str]:
+    return [t.lower() for t in _TOKEN_RE.findall(text)]
+
+@dataclass
+class BM25Index:
+    N: int
+    doc_len: List[int]
+    avgdl: float
+    df: Dict[str, int]
+    tfs: List[Dict[str, int]]
+    k1: float = 1.2
+    b: float = 0.75
+    def idf(self, term: str) -> float:
+        n = self.df.get(term, 0)
+        if n == 0: return 0.0
+        return math.log((self.N - n + 0.5) / (n + 0.5) + 1e-12)
+    def score(self, q_tokens: Sequence[str], doc_id: int) -> float:
+        tf = self.tfs[doc_id]
+        dl = self.doc_len[doc_id]
+        s = 0.0
+        for term in q_tokens:
+            f = tf.get(term, 0)
+            if f == 0: continue
+            idf = self.idf(term)
+            denom = f + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+            s += idf * (f * (self.k1 + 1)) / (denom + 1e-12)
+        return s
+
+def build_bm25_index(docs_tokens: List[List[str]], k1=1.2, b=0.75) -> BM25Index:
+    N = len(docs_tokens)
+    tfs: List[Dict[str,int]] = []
+    df: Dict[str,int] = defaultdict(int)
+    doc_len: List[int] = []
+    for toks in docs_tokens:
+        c = Counter(toks)
+        tfs.append(c)
+        doc_len.append(len(toks))
+        for term in c: df[term] += 1
+    avgdl = (sum(doc_len)/N) if N else 0.0
+    return BM25Index(N=N, doc_len=doc_len, avgdl=avgdl, df=dict(df), tfs=tfs, k1=k1, b=b)
+
+
+class BM25FolderSearchV1(hybridSearch):
+    """
+    BM25 search over a folder of .txt chunks (no metadata needed).
+
+    cfg.paths.chunks_dir          -> folder that contains *.txt chunks
+    cfg.paths.bm25_results_path   -> where JSON is written (default ./data/workspace/bm25_results.json)
+
+    Output JSON matches vector step:
+      { "query": "...",
+        "results": [
+          { "doc_id": int,
+            "chunkname": str,            # relative path name
+            "filename_txt": str,
+            "file_path_html": "",        # left blank; fill if you have a mapping
+            "scores": {"bm25": float}
+          }, ...
+        ]
+      }
+    """
+    name = "bm25FolderSearchV1"
+
+    def run(self, ctx: Context) -> None:
+        log = get_logger(self.name)
+
+        pcfg = ctx.cfg.get("paths", {}) or {}
+        chunks_dir = Path(pcfg.get("chunks_dir", "./data/workspace/chunking_files"))
+        out_path = Path(pcfg.get("bm25_results_path", "./data/workspace/bm25_results.json"))
+
+        if not chunks_dir.exists():
+            log.error("chunks_dir not found: %s", chunks_dir)
+            return
+
+        qcfg = ctx.cfg.get("query", {}) or {}
+        k = int(qcfg.get("k", 10))
+        qtext = ctx.artifacts.get("corrected_query") or qcfg.get("text")
+        if not qtext:
+            log.error("No query text provided. Set artifacts['corrected_query'] or cfg.query.text")
+            return
+        q_tokens = simple_tokenize(qtext)
+
+        bcfg = ctx.cfg.get("bm25", {}) or {}
+        k1 = float(bcfg.get("k1", 1.2))
+        b = float(bcfg.get("b", 0.75))
+        cache_path = Path(bcfg.get("cache_path", "./data/workspace/bm25_tokens_cache.json"))
+
+        # Collect chunk files (stable order)
+        files = sorted([p for p in chunks_dir.rglob("*.txt") if p.is_file()])
+
+        # Try to load token cache
+        docs_tokens: List[List[str]] = []
+        cache_ok = False
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                if cached.get("chunks_dir") == str(chunks_dir) and cached.get("files") == [str(f) for f in files]:
+                    docs_tokens = cached["docs_tokens"]
+                    cache_ok = True
+            except Exception:
+                cache_ok = False
+
+        # (Re)tokenize if no valid cache
+        if not cache_ok:
+            docs_tokens = []
+            for f in files:
+                try:
+                    txt = f.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    txt = ""
+                docs_tokens.append(simple_tokenize(txt))
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(
+                    json.dumps(
+                        {"chunks_dir": str(chunks_dir), "files": [str(f) for f in files], "docs_tokens": docs_tokens},
+                        ensure_ascii=False
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                log.warning("Failed to write BM25 token cache: %s", e)
+
+        # Build index and score
+        bm25 = build_bm25_index(docs_tokens, k1=k1, b=b)
+        scores = [(i, float(bm25.score(q_tokens, i))) for i in range(len(files))]
+        scores.sort(key=lambda x: x[1], reverse=True)
+        top = scores[:k]
+
+        # Emit JSON compatible with your vector results
+        results = []
+        for pos, s in top:
+            f = files[pos]
+            results.append({
+                "doc_id": pos,                              # stable within this folder ordering
+                "chunkname": str(f.relative_to(chunks_dir)),
+                "filename_txt": f.name,
+                "file_path_html": "",                       # fill if you have an .htm mapping
+                "scores": {"bm25": s},
+            })
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps({"query": qtext, "results": results}, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("BM25 top %d written to %s", len(results), out_path)
+        ctx.artifacts["bm25_results_path"] = str(out_path)
+
+
+---
+
+2) Config (matches your screenshots)
+
+Add two lines and (optionally) BM25 params:
+
+paths:
+  vector_dataset_dir: ./Daten/workspace/vector_dataset
+  source_html_root: "C:\\Entwicklung\\...\\Help"
+  source_txt_root:  "C:\\Entwicklung\\...\\txt_files"
+  vector_results_path: ./Daten/workspace/vector_results.json
+  chunks_dir: ./Daten/workspace/chunking_files           # <— your folder with chunks
+  bm25_results_path: ./Daten/workspace/bm25_results.json # <— output
+
+query:
+  k: 10
+  text: ""  # or provided via ctx.artifacts['corrected_query']
+
+bm25:
+  k1: 1.2
+  b: 0.75
+  cache_path: ./Daten/workspace/bm25_tokens_cache.json
+
+run:
+  steps: ["query_parsing", "bm25_search"]  # or add alongside "vector_search"
+
+(If your runner expects the class name to match the step key, register "bm25_search" → BM25FolderSearchV1 the same way you did for vector_search.)
+
+
+---
+
+3) Output shape (example)
+
+{
+  "query": "Wie kann ich Querprofillinien…",
+  "results": [
+    {
+      "doc_id": 17,
+      "chunkname": "content+achsplot+…_chunk0011.txt",
+      "filename_txt": "content+achsplot+…_chunk0011.txt",
+      "file_path_html": "",
+      "scores": { "bm25": 12.947 }
+    }
+  ]
+}
+
+
+---
+
+4) Tips
+
+Your chunks look HTML-ish (see <tr> in the third photo). If needed, strip tags before tokenizing:
+
+txt = re.sub(r"<[^>]+>", " ", txt)
+
+For a hybrid result, merge bm25_results.json and vector_results.json by normalizing each score list and taking a weighted sum (e.g., 0.5 * vector + 0.5 * bm25).
+
+
+If you want me to wire the hybrid combiner into your existing pipeline step, I can drop in a small HybridSearchV1 that reads both JSONs and emits a fused hybrid_results.json.
+
