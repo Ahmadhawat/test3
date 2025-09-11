@@ -1,0 +1,378 @@
+Got it 👍 — let me put everything together into one complete file for your HybridSearchV1.
+This version supports:
+
+FAISS semantic search
+
+Whoosh BM25 with auto analyzer detection
+
+If analyzer.json in the index says "keyword", we preserve full compounds (e.g. Querprofillinien)
+
+Otherwise fallback to stemmed/term OR search
+
+
+Fusion methods: rrf (default), minmax, zscore
+
+Writes clean JSON results
+
+
+
+---
+
+📄 Complete Code: CHybridSearchV1.py
+
+# src/steps/hybrid_search_impls/CHybridSearchV1.py
+
+from pathlib import Path
+import json
+from typing import Dict, List, Tuple
+import os
+import re
+
+import faiss
+import numpy as np
+
+from whoosh import index as whoosh_index
+from whoosh.scoring import BM25F
+from whoosh import query as Q
+from whoosh.qparser import QueryParser
+
+from sentence_transformers import SentenceTransformer
+
+# Project-local utilities
+from src.steps.hybrid_search_impls.CHybridSearchABS import hybridSearch
+from src.pipeline.Context import Context
+from src.utils.logging import get_logger
+
+
+# -----------------------------
+# helpers
+# -----------------------------
+
+def _normalize2(v: np.ndarray) -> np.ndarray:
+    v = v.astype("float32")
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    n = np.maximum(n, 1e-12)
+    return v / n
+
+
+def _is_ivf(idx) -> bool:
+    return isinstance(
+        idx,
+        (faiss.IndexIVFFlat, faiss.IndexIVFPQ, faiss.IndexIVFScalarQuantizer),
+    )
+
+
+def _minmax(scores: Dict[int, float]) -> Dict[int, float]:
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    lo, hi = min(vals), max(vals)
+    if hi - lo <= 1e-12:
+        return {k: 1.0 for k in scores}
+    return {k: (v - lo) / (hi - lo) for k, v in scores.items()}
+
+
+def _zscore(scores: Dict[int, float]) -> Dict[int, float]:
+    if not scores:
+        return {}
+    vals = np.array(list(scores.values()), dtype="float32")
+    mu = float(vals.mean())
+    sd = float(vals.std() + 1e-12)
+    return {k: (v - mu) / sd for k, v in scores.items()}
+
+
+def _rrf(rank: int, k: int = 60) -> float:
+    return 1.0 / (k + rank)
+
+
+_CHUNK_SUFFIX_RE = re.compile(r"_chunk\d{4}\.txt$", re.IGNORECASE)
+
+
+def chunk_to_real_path(chunk_filename: str, source_html_root: str | None = None) -> str:
+    rel = _CHUNK_SUFFIX_RE.sub(".htm", chunk_filename)
+    rel = rel.replace("\\", "/").replace("/", os.sep)
+    return os.path.join(source_html_root, rel) if source_html_root else rel
+
+
+def chunk_to_real_txt(chunk_filename: str, source_txt_root: str | None = None) -> str:
+    rel = _CHUNK_SUFFIX_RE.sub(".txt", chunk_filename)
+    rel = rel.replace("\\", "/").replace("/", os.sep)
+    return os.path.join(source_txt_root, rel) if source_txt_root else rel
+
+
+def _norm_path(s: str) -> str:
+    return s.replace("\\", "/")
+
+
+def _is_int_str(s) -> bool:
+    return isinstance(s, str) and s.isdigit()
+
+
+def _detect_analyzer_type(lroot: str) -> str:
+    """
+    Look for analyzer.json metadata file in index dir.
+    Returns 'keyword' if index was built with KeywordAnalyzer,
+    otherwise empty string.
+    """
+    meta_file = os.path.join(lroot, "analyzer.json")
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            analyzer = meta.get("analyzer", "").lower()
+            if analyzer in ("keyword", "stemmed", "simple"):
+                return analyzer
+        except Exception:
+            pass
+    return ""
+
+
+# -----------------------------
+# main class
+# -----------------------------
+
+class HybridSearchV1(hybridSearch):
+    name = "hybridSearchV1"
+
+    def run(self, ctx: Context) -> None:
+        log = get_logger(self.name)
+
+        # -------- Paths & config --------
+        vroot = Path(ctx.cfg["paths"]["vector_dataset_dir"])
+        lroot = Path(ctx.cfg["paths"]["lexical_index_dir"])
+
+        index_path = vroot / "vector_index.faiss"
+        meta_path = vroot / "vector_metadata.json"
+
+        if not index_path.exists() or not meta_path.exists():
+            log.error("Missing FAISS index or metadata in %s", vroot)
+            return
+        if not lroot.exists():
+            log.error("Missing lexical index dir: %s", lroot)
+            return
+
+        qcfg = ctx.cfg.get("query", {}) or {}
+        fusion = ctx.cfg.get("fusion", {}) or {}
+
+        k = int(qcfg.get("k", 10))
+        k_vec = int(qcfg.get("k_vec", 50))   # default 50
+        k_lex = int(qcfg.get("k_lex", 50))   # default 50
+        method = str(fusion.get("method", "rrf")).lower()  # default RRF
+        alpha = float(fusion.get("alpha", 0.5))
+        rrf_k = int(fusion.get("rrf_k", 60))
+
+        # Query text
+        qtext = ctx.artifacts.get("corrected_query") or qcfg.get("text")
+        if not qtext:
+            log.error("No query text provided. Set artifacts['query_text'] or cfg.query.text")
+            return
+
+        # -------- Embedder --------
+        ecfg = ctx.cfg.get("embedding", {}) or {}
+        model_name = ecfg.get("model_name", "")
+        cache_folder = ecfg.get("cache_folder", "./data/models/st")
+        try:
+            model = SentenceTransformer(model_name, cache_folder=cache_folder)
+        except Exception as e:
+            log.error("Failed to load SentenceTransformer '%s': %s", model_name, e)
+            return
+
+        esp = ctx.cfg.get("es_prefixes", {}) or {}
+        use_es = bool(esp.get("use", False))
+        qprefix = esp.get("query_prefix", "query: ")
+
+        # -------- Metadata --------
+        try:
+            raw_meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+        except Exception as e:
+            log.error("Failed to read metadata: %s", e)
+            return
+
+        id2name_raw = raw_meta.get("id_to_filename", raw_meta)
+        if not isinstance(id2name_raw, dict):
+            log.error("vector_metadata.json has unexpected structure")
+            return
+
+        id2name = {k: v for k, v in id2name_raw.items() if _is_int_str(k) and isinstance(v, str)}
+        name2id = {_norm_path(v): int(k) for k, v in id2name.items()}
+
+        def meta_get(did: int) -> str:
+            return id2name.get(str(did), "")
+
+        # -------- FAISS search --------
+        try:
+            index = faiss.read_index(str(index_path))
+        except Exception as e:
+            log.error("Failed to read FAISS index: %s", e)
+            return
+
+        if _is_ivf(index):
+            nprobe = int(ctx.cfg.get("faiss", {}).get("nprobe", 32))
+            try:
+                faiss.ParameterSpace().set_index_parameter(index, "nprobe", nprobe)
+            except Exception:
+                try:
+                    index.nprobe = nprobe  # type: ignore
+                except Exception:
+                    pass
+
+        q_in = f"{qprefix}{qtext}" if use_es else qtext
+        try:
+            qv = model.encode([q_in], show_progress_bar=False)
+        except Exception as e:
+            log.error("Embedding failed: %s", e)
+            return
+        qv = _normalize2(np.asarray(qv, dtype="float32"))
+
+        D, I = index.search(qv, k_vec)
+        vec_scores: Dict[int, float] = {}
+        for doc_id, score in zip(I[0].tolist(), D[0].tolist()):
+            if int(doc_id) < 0:
+                continue
+            vec_scores[int(doc_id)] = float(score)
+
+        # -------- BM25 search --------
+        try:
+            ix = whoosh_index.open_dir(str(lroot))
+        except Exception as e:
+            log.error("Failed to open Whoosh index: %s", e)
+            return
+
+        analyzer_type = _detect_analyzer_type(str(lroot))
+        lex_scores: Dict[int, float] = {}
+        try:
+            with ix.searcher(weighting=BM25F()) as searcher:
+                analyzer = ix.schema["text"].analyzer
+                if analyzer_type == "keyword":
+                    parser = QueryParser("text", schema=ix.schema)
+                    q = parser.parse(qtext) if qtext.strip() else Q.Every()
+                else:
+                    tokens = [tok.text for tok in analyzer(qtext) if tok.text]
+                    q = Q.Or([Q.Term("text", t) for t in tokens]) if tokens else Q.Every()
+
+                hits = searcher.search(q, limit=k_lex)
+                for h in hits:
+                    fields = h.fields()
+                    did = fields.get("doc_id")
+                    real_id = None
+                    if did is not None and str(did) in id2name:
+                        real_id = int(did)
+                    else:
+                        for key in ("chunkname", "filename", "path", "file", "name"):
+                            val = fields.get(key)
+                            if isinstance(val, str):
+                                real_id = name2id.get(_norm_path(val))
+                                if real_id is not None:
+                                    break
+                    if real_id is None:
+                        continue
+                    lex_scores[int(real_id)] = float(h.score)
+        except Exception as e:
+            log.error("Whoosh search failed: %s", e)
+            return
+
+        # -------- Fusion --------
+        all_ids = set(vec_scores) | set(lex_scores)
+        fused_pairs: List[Tuple[int, float]] = []
+
+        if method == "rrf":
+            vec_sorted = sorted(vec_scores.items(), key=lambda x: x[1], reverse=True)
+            lex_sorted = sorted(lex_scores.items(), key=lambda x: x[1], reverse=True)
+            vec_rank = {doc_id: r + 1 for r, (doc_id, _) in enumerate(vec_sorted)}
+            lex_rank = {doc_id: r + 1 for r, (doc_id, _) in enumerate(lex_sorted)}
+            for did in all_ids:
+                vr = vec_rank.get(did, len(vec_rank) + 1)
+                lr = lex_rank.get(did, len(lex_rank) + 1)
+                s = _rrf(vr, rrf_k) + _rrf(lr, rrf_k)
+                fused_pairs.append((did, s))
+        elif method == "zscore":
+            vnorm = _zscore(vec_scores)
+            lnorm = _zscore(lex_scores)
+            for did in all_ids:
+                s = alpha * vnorm.get(did, 0.0) + (1.0 - alpha) * lnorm.get(did, 0.0)
+                fused_pairs.append((did, s))
+        else:  # minmax
+            vnorm = _minmax(vec_scores)
+            lnorm = _minmax(lex_scores)
+            for did in all_ids:
+                s = alpha * vnorm.get(did, 0.0) + (1.0 - alpha) * lnorm.get(did, 0.0)
+                fused_pairs.append((did, s))
+
+        fused_pairs.sort(key=lambda x: x[1], reverse=True)
+        top_ids = [did for did, _ in fused_pairs[:k]]
+
+        # -------- Results --------
+        results = []
+        fused_map = dict(fused_pairs)
+        source_html_root = ctx.cfg["paths"].get("source_html_root", "")
+        source_txt_root = ctx.cfg["paths"].get("source_txt_root", "")
+
+        for did in top_ids:
+            fname = meta_get(did)
+            if not fname:
+                continue
+            file_html = chunk_to_real_path(fname, source_html_root or None)
+            file_txt = chunk_to_real_txt(fname, source_txt_root or None)
+            results.append(
+                {
+                    "doc_id": int(did),
+                    "chunkname": fname,
+                    "filename_txt": str(Path(file_txt).name) if file_txt else "",
+                    "file_path_html": file_html,
+                    "scores": {
+                        "vector": float(vec_scores.get(did, 0.0)),
+                        "lexical": float(lex_scores.get(did, 0.0)),
+                        "hybrid": float(fused_map.get(did, 0.0)),
+                    },
+                }
+            )
+
+        out_path = Path(ctx.cfg["paths"].get("hybrid_results_path", "./data/workspace/hybrid_results.json"))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            out_path.write_text(
+                json.dumps({"query": qtext, "results": results}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log.error("Failed to write hybrid results: %s", e)
+            return
+
+        log.info("Hybrid (%s) top %d written to %s", method, k, out_path)
+        ctx.artifacts["hybrid_results_path"] = str(out_path)
+
+
+---
+
+✅ How to use
+
+1. If you migrated your index with KeywordAnalyzer, make sure analyzer.json exists in the index folder:
+
+
+
+{
+  "analyzer": "keyword"
+}
+
+2. In config.yaml:
+
+
+
+paths:
+  vector_dataset_dir: "./data/vector_index"
+  lexical_index_dir: "./data/lexical_index_kw"
+  hybrid_results_path: "./data/workspace/hybrid_results.json"
+
+fusion:
+  method: "rrf"   # or minmax/zscore
+  rrf_k: 60
+
+3. Run your pipeline → compounds like Querprofillinien will now be preserved.
+
+
+
+
+---
+
+👉 Do you want me to also provide an updated index builder script that automatically writes analyzer.json so you don’t need to manage that separately?
+
